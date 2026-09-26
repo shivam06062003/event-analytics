@@ -21,7 +21,7 @@ jobs:
       - run: mypy app
 
   test:
-    name: Tests (real Postgres + Redpanda)
+    name: Tests (real Postgres, Redpanda, ClickHouse, Redis)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -34,6 +34,29 @@ jobs:
           - 5433:5432
         options: >-
           --health-cmd "pg_isready -U analytics -d analytics"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_USER: analytics
+          CLICKHOUSE_PASSWORD: analytics
+          CLICKHOUSE_DB: analytics
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user analytics --password analytics -q 'SELECT 1'"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6381:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15

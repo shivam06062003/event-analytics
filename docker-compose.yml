@@ -3,6 +3,8 @@
 x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://analytics:analytics@postgres:5432/analytics
   KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  CLICKHOUSE_HOST: clickhouse
+  REDIS_URL: redis://redis:6379/0
   ENVIRONMENT: local
   LOG_LEVEL: INFO
   LOG_JSON: "true"
@@ -48,15 +50,54 @@ services:
       timeout: 5s
       retries: 20
 
-  # One-off: database migrations + Kafka topics, both "infrastructure as code".
+  # Column-oriented analytics database for events. Capped for an 8GB laptop
+  # via clickhouse/config.d/low-memory.xml.
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"   # HTTP interface (used by the Python client)
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+      - ./clickhouse/config.d/low-memory.xml:/etc/clickhouse-server/config.d/low-memory.xml:ro
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "analytics", "--password", "analytics", "-q", "SELECT 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # The processor's dedup window (recently stored event_ids).
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6381:6379"   # 6381: avoids local Redis instances on 6379/6380
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # One-off: Postgres migrations, Kafka topics, ClickHouse migrations: all
+  # infrastructure as code, applied before anything starts.
   migrate:
     build: .
-    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-topics"]
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && python -m app.cli ensure-topics && python -m app.cli clickhouse-migrate
     environment: *app-env
     depends_on:
       postgres:
         condition: service_healthy
       redpanda:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
 
   api:
@@ -68,6 +109,29 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  # Kafka -> ClickHouse. Scale with `docker compose up -d --scale processor=3`
+  # (useful up to one replica per partition: 6).
+  processor:
+    build: .
+    command: ["python", "-m", "app.processor"]
+    restart: unless-stopped
+    environment: *app-env
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/processor-heartbeat') > 30)"
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
   # Optional web UI for browsing topics and messages: `make console` -> :8081
   console:
@@ -84,3 +148,4 @@ services:
 volumes:
   pgdata:
   redpanda:
+  clickhouse:

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 
+from app.core import clickhouse
 from app.core.config import get_settings
 from app.core.db import SessionLocal, engine
 from app.core.kafka import ensure_topics
@@ -24,6 +25,9 @@ async def _run(args: argparse.Namespace) -> None:
             await _create_project(args.name)
         elif args.command == "ensure-topics":
             await ensure_topics(get_settings())
+        elif args.command == "clickhouse-migrate":
+            applied = await clickhouse.migrate(get_settings())
+            print(f"Applied {len(applied)} ClickHouse migration(s): {applied}", file=sys.stderr)
     finally:
         await engine.dispose()
 
@@ -34,6 +38,7 @@ def main(argv: list[str] | None = None) -> None:
     create = commands.add_parser("create-project", help="Create a project and print its write key")
     create.add_argument("--name", required=True)
     commands.add_parser("ensure-topics", help="Create Kafka topics if missing (idempotent)")
+    commands.add_parser("clickhouse-migrate", help="Apply pending ClickHouse migrations")
     asyncio.run(_run(parser.parse_args(argv)))
 
 

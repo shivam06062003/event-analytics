@@ -35,7 +35,12 @@ async def test_not_ready_when_kafka_is_unreachable(
 
 async def test_ensure_topics_is_idempotent_and_sets_partitions(client: AsyncClient) -> None:
     settings = get_settings()
-    await ensure_topics(settings)  # already exists: must not fail
+    # The session fixture already created them, so both must report "exists".
+    # (Only asserting "didn't crash" once hid a bug: failures looked like success.)
+    assert await ensure_topics(settings) == {
+        settings.raw_events_topic: "exists",
+        settings.dead_letter_topic: "exists",
+    }
 
     admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap_servers)
     await admin.start()

@@ -1,0 +1,17 @@
+<!-- Tuned for a laptop (Docker has ~4GB for everything). Production servers
+     keep the defaults, which assume ClickHouse owns the machine. -->
+<clickhouse>
+    <max_server_memory_usage>1200000000</max_server_memory_usage>
+    <mark_cache_size>268435456</mark_cache_size>
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+    <!-- System log tables that write continuously in the background. -->
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <text_log remove="1"/>
+    <processors_profile_log remove="1"/>
+</clickhouse>

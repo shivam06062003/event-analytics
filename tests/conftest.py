@@ -18,6 +18,15 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 TEST_TOPIC = f"test.events.raw.{uuid.uuid4().hex[:8]}"
 os.environ["RAW_EVENTS_TOPIC"] = TEST_TOPIC
 os.environ["RAW_EVENTS_PARTITIONS"] = "3"
+SESSION = uuid.uuid4().hex[:8]
+TEST_DLQ_TOPIC = f"test.events.dlq.{SESSION}"
+os.environ["DEAD_LETTER_TOPIC"] = TEST_DLQ_TOPIC
+os.environ["CLICKHOUSE_DATABASE"] = f"analytics_test_{SESSION}"
+os.environ["CLICKHOUSE_MIGRATIONS_DIR"] = str(
+    Path(__file__).resolve().parents[1] / "clickhouse/migrations"
+)
+os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:6381/14")
+os.environ["PROCESSOR_GROUP_ID"] = f"test-processor-{SESSION}"
 
 import asyncpg  # noqa: E402
 import orjson  # noqa: E402
@@ -129,7 +138,7 @@ async def kafka() -> AsyncIterator[TopicCollector]:
     admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap_servers)
     await admin.start()
     try:
-        await admin.delete_topics([TEST_TOPIC])
+        await admin.delete_topics([TEST_TOPIC, TEST_DLQ_TOPIC])
     finally:
         await admin.close()
 
@@ -178,3 +187,78 @@ def event(**overrides: Any) -> dict[str, Any]:
     }
     body.update(overrides)
     return body
+
+
+# --- Processor fixtures (ClickHouse + Redis) -----------------------------------
+
+from clickhouse_connect.driver.asyncclient import AsyncClient as ClickHouseClient  # noqa: E402
+from redis.asyncio import Redis  # noqa: E402
+
+from app.core import clickhouse as clickhouse_core  # noqa: E402
+from app.core.kafka import build_producer  # noqa: E402
+from app.processor.dedup import Deduplicator  # noqa: E402
+from app.processor.processor import BatchResult, Processor, build_consumer  # noqa: E402
+from app.processor.sink import ClickHouseSink  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+async def ch(kafka: TopicCollector) -> AsyncIterator[ClickHouseClient]:
+    """A throwaway ClickHouse database per session, built by the real migrations."""
+    settings = get_settings()
+    await clickhouse_core.migrate(settings)
+    client = await clickhouse_core.create_client(settings)
+    yield client
+    await client.command(f"DROP DATABASE IF EXISTS `{settings.clickhouse_database}`")
+    await client.close()
+
+
+@pytest.fixture(scope="session")
+async def redis() -> AsyncIterator[Redis]:
+    client = Redis.from_url(get_settings().redis_url)
+    yield client
+    await client.flushdb()
+    await client.aclose()
+
+
+@pytest.fixture(scope="session")
+async def processor(ch: ClickHouseClient, redis: Redis) -> AsyncIterator[Processor]:
+    """One consumer group for the whole session (joining a group takes a few
+    seconds). Each test drains whatever it produced."""
+    settings = get_settings()
+    consumer = build_consumer(settings)
+    producer = build_producer(settings)
+    await producer.start()
+    await consumer.start()
+    proc = Processor(
+        consumer,
+        producer,
+        ClickHouseSink(ch),
+        Deduplicator(redis, settings.dedup_window_seconds),
+        settings,
+    )
+    yield proc
+    await consumer.stop()
+    await producer.stop()
+
+
+@pytest.fixture(autouse=True)
+async def clean_processor_state(request: pytest.FixtureRequest) -> None:
+    if "processor" in request.fixturenames or "ch" in request.fixturenames:
+        ch_client: ClickHouseClient = request.getfixturevalue("ch")
+        await ch_client.command("TRUNCATE TABLE events")
+        redis_client: Redis = request.getfixturevalue("redis")
+        await redis_client.flushdb()
+
+
+async def drain(processor: Processor, max_empty_polls: int = 3) -> list[BatchResult]:
+    """Run the processor until the topic is caught up."""
+    results: list[BatchResult] = []
+    empty = 0
+    while empty < max_empty_polls:
+        result = await processor.run_once(poll_timeout_ms=300)
+        if result.consumed:
+            results.append(result)
+            empty = 0
+        else:
+            empty += 1
+    return results

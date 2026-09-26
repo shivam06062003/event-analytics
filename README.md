@@ -7,7 +7,7 @@ send user events. The platform ingests them at high volume through Kafka,
 processes them, and answers funnel, retention and segmentation queries from
 ClickHouse.
 
-> **Status:** Phase 1 (ingestion) complete. See [Roadmap](#roadmap).
+> **Status:** Phase 2 (stream processing) complete. See [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -16,17 +16,43 @@ flowchart LR
     SDK[App / SDK] -- "POST /v1/batch<br/>write key" --> API[Ingestion API]
     API -- "acks=all, idempotent<br/>key = project:user" --> K[(Redpanda<br/>events.raw)]
     K --> P[Processor<br/>consumer group]
-    P --> CH[(ClickHouse)]
+    P -- "batched INSERT<br/>commit after write" --> CH[(ClickHouse<br/>ReplacingMergeTree)]
+    P -- "poison messages" --> DLQ[(events.dlq)]
+    P <-. "dedup window" .-> R[(Redis)]
     Q[Query API] --> CH
     API -. "write keys (cached)" .-> PG[(Postgres<br/>metadata)]
     classDef next stroke-dasharray: 5 5
-    class P,CH,Q next
+    class Q next
 ```
 
-Dashed components arrive in later phases. The design rationale is in
-[ADR 0001](docs/adr/0001-architecture-and-ingestion.md).
+Dashed components arrive in later phases. Design rationale:
+[ADR 0001](docs/adr/0001-architecture-and-ingestion.md) (architecture and ingestion) and
+[ADR 0002](docs/adr/0002-stream-processing-and-deduplication.md) (processing and dedup).
 
-## Highlights (Phase 1)
+## Highlights
+
+### Processing (Phase 2)
+
+- **At-least-once, never lossy.** Offsets are committed only after the
+  ClickHouse insert succeeds. A test stops the processor mid-outage and
+  checks the committed offsets didn't move. Committing first makes the test
+  fail.
+- **Two-layer deduplication.** Kafka redeliveries (identical rows) are
+  collapsed by `ReplacingMergeTree`. Client retries (same `event_id`, new
+  `received_at`, so a different sort key) are caught by a Redis window that
+  is marked *after* the insert, so a crash can never drop an event. Removing
+  the Redis layer makes the retry test fail.
+- **Poison messages don't block partitions.** Unparseable or unknown-version
+  messages go to `events.dlq` with the original bytes and their source
+  partition and offset.
+- **Backpressure without rebalance storms.** While ClickHouse is down, the
+  processor pauses its partitions but keeps polling, so it stays in the
+  consumer group. Kafka buffers, and it resumes automatically.
+- **ClickHouse-friendly writes.** One batched insert per poll, a sort key
+  matched to query patterns, monthly partitions, and Kafka lineage columns on
+  every row.
+
+### Ingestion (Phase 1)
 
 - **Durable ingestion.** `202 Accepted` is returned only after the broker
   acknowledges the write (`acks=all`, idempotent producer). A test with a
@@ -57,7 +83,9 @@ Prerequisites: Docker Desktop and Python 3.12+.
 make up                                   # postgres, redpanda, migrations + topics, api on :8001
 KEY=$(make -s project name="Demo app")    # create a project; prints its write key
 make send key=$KEY                        # {"accepted":2,"rejected":[]}
-make console                              # browse the messages at http://localhost:8081
+make events                               # the events, now queryable in ClickHouse
+make lag                                  # consumer lag per partition
+make console                              # browse topics/messages at http://localhost:8081
 ```
 
 ### Local development
@@ -108,18 +136,20 @@ Rules:
 app/
   api/            Routes, auth (write keys), middleware (request id, size limit), errors
   services/       Ingestion (validation, skew correction, produce), projects/keys
-  core/           Config, logging, Postgres, Kafka producer + topic management
+  processor/      Kafka consumer -> ClickHouse: parse, dedup, sink, DLQ, commit
+  core/           Config, logging, Postgres, ClickHouse (+ migration runner), Kafka
   models/         Postgres metadata tables
   schemas/        Event and batch schemas
-migrations/       Alembic
-tests/            Against real Postgres + Redpanda (per-session topic)
+migrations/       Alembic (Postgres)
+clickhouse/       ClickHouse migrations + low-memory server config
+tests/            Against real Postgres, Redpanda, ClickHouse and Redis (isolated per session)
 docs/adr/         Architecture Decision Records
 ```
 
 ## Roadmap
 
 - [x] **Phase 1: Ingestion.** Batch API, write keys, durable idempotent producer, partitioning, skew correction, partial acceptance, limits.
-- [ ] **Phase 2: Processing.** Consumer group writes to ClickHouse, dedup by `event_id`, dead-letter topic, commit after write, lag metrics.
+- [x] **Phase 2: Processing.** Consumer group writes to ClickHouse, two-layer dedup, dead-letter topic, commit after write, pause-based backpressure, lag.
 - [ ] **Phase 3: Query API.** Segmentation, funnels, retention, read keys, caching, query limits.
 - [ ] **Phase 4: Sessions and schemas.** Sessionization, late events, identity merge, tracking plans with schema evolution.
 - [ ] **Phase 5: Operability.** Metrics, tracing, per-project quotas, load test (target: 20k+ events/s).

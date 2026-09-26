@@ -25,6 +25,27 @@ class Settings(BaseSettings):
     raw_events_partitions: int = 6
     kafka_replication_factor: int = 1  # 3 in production, across brokers
     kafka_send_timeout_seconds: float = 10.0
+    dead_letter_topic: str = "events.dlq"
+    dead_letter_partitions: int = 1
+
+    # ClickHouse (event storage)
+    clickhouse_host: str = "localhost"
+    clickhouse_port: int = 8123
+    clickhouse_user: str = "analytics"
+    clickhouse_password: str = "analytics"
+    clickhouse_database: str = "analytics"
+    clickhouse_migrations_dir: str = "clickhouse/migrations"
+
+    # Redis: the processor's window of recently stored event_ids (dedup)
+    redis_url: str = "redis://localhost:6381/0"
+    dedup_window_seconds: int = 86_400
+
+    # Processor (Kafka consumer group -> ClickHouse)
+    processor_group_id: str = "event-processor"
+    processor_max_batch: int = 5_000
+    processor_poll_timeout_ms: int = 1_000
+    processor_retry_max_backoff_seconds: float = 30.0
+    processor_heartbeat_path: str = "/tmp/processor-heartbeat"
 
     # Ingestion limits
     max_request_bytes: int = 1_000_000
