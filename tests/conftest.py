@@ -147,7 +147,7 @@ async def kafka() -> AsyncIterator[TopicCollector]:
 async def clean_state() -> None:
     project_service.clear_write_key_cache()
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE write_keys, projects"))
+        await conn.execute(text("TRUNCATE read_keys, write_keys, projects"))
 
 
 @pytest.fixture
@@ -262,3 +262,36 @@ async def drain(processor: Processor, max_empty_polls: int = 3) -> list[BatchRes
         else:
             empty += 1
     return results
+
+
+# --- Query API fixtures ----------------------------------------------------------
+
+from app.query import cache as query_cache  # noqa: E402
+from app.query import executor as query_executor  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+async def query_backends(ch: ClickHouseClient, redis: Redis) -> AsyncIterator[None]:
+    query_executor.set_client(ch)
+    query_cache.set_redis(redis)
+    yield
+    query_executor.set_client(None)
+    query_cache.set_redis(None)
+
+
+@dataclass
+class Reader:
+    project: ProjectFixture
+    read_key: str
+    read_key_id: uuid.UUID
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.read_key}"}
+
+
+@pytest.fixture
+async def reader(project: ProjectFixture, query_backends: None) -> Reader:
+    async with SessionLocal() as session:
+        created = await project_service.create_read_key(session, uuid.UUID(project.id))
+    return Reader(project, created.read_key, created.read_key_id)

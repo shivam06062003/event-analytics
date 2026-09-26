@@ -58,6 +58,23 @@ async def migrate(settings: Settings) -> list[str]:
         await client.close()
 
 
+async def seed_demo(settings: Settings, project_id: str, users: int, start: str) -> int:
+    """Generate demo events for a project (see clickhouse/seed/demo.sql).
+    Returns the number of rows the project now has."""
+    sql = await asyncio.to_thread(Path("clickhouse/seed/demo.sql").read_text)
+    params = {"project": project_id, "users": users, "start": start}
+    client = await create_client(settings)
+    try:
+        for statement in _statements(sql):
+            await client.command(statement, parameters=params)
+        result = await client.query(
+            "SELECT count() FROM events WHERE project_id = {project:UUID}", parameters=params
+        )
+        return int(result.result_rows[0][0])
+    finally:
+        await client.close()
+
+
 def _load(directory: str) -> list[tuple[str, str]]:
     return [(path.stem, path.read_text()) for path in sorted(Path(directory).glob("*.sql"))]
 

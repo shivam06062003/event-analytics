@@ -1,4 +1,4 @@
-.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check
+.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check read-key seed
 
 install:        ## Create venv and install app + dev tools
 	python3.13 -m venv .venv
@@ -56,3 +56,9 @@ typecheck:
 	.venv/bin/mypy app
 
 check: lint typecheck test   ## Everything CI runs
+
+read-key:       ## Create a read (query) key: make read-key project=<project id>
+	@docker compose exec -T api python -m app.cli create-read-key --project "$(project)"
+
+seed:           ## Demo data straight into ClickHouse: make seed project=<id> [users=200000]
+	@docker compose exec -T api python -m app.cli seed-demo --project "$(project)" --users $(or $(users),200000)

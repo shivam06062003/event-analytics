@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     processor_retry_max_backoff_seconds: float = 30.0
     processor_heartbeat_path: str = "/tmp/processor-heartbeat"
 
+    # Query API: guard rails that keep one expensive query from hurting everyone
+    query_max_execution_seconds: int = 10
+    query_max_memory_bytes: int = 500_000_000
+    query_max_range_days: int = 366
+    query_max_buckets: int = 1_000
+    query_breakdown_limit: int = 10
+    # Result cache: short TTL when the range touches recent data (still
+    # changing), long TTL for purely historical ranges.
+    query_cache_ttl_recent_seconds: int = 30
+    query_cache_ttl_historical_seconds: int = 3_600
+
     # Ingestion limits
     max_request_bytes: int = 1_000_000
     max_batch_events: int = 500

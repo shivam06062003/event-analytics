@@ -10,11 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.models import Project, WriteKey
+from app.models import Project, ReadKey, WriteKey
 from app.repositories import write_keys as write_keys_repo
 from app.services.errors import Unauthenticated
 
 WRITE_KEY_PREFIX = "wk_"
+READ_KEY_PREFIX = "rk_"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,38 @@ async def create_project(session: AsyncSession, name: str) -> CreatedProject:
         key = WriteKey(project_id=project.id, prefix=plaintext[:11], key_hash=hash_key(plaintext))
         session.add(key)
     return CreatedProject(project.id, key.id, plaintext)
+
+
+@dataclass(frozen=True)
+class CreatedReadKey:
+    read_key_id: uuid.UUID
+    read_key: str  # plaintext, shown once
+
+
+async def create_read_key(session: AsyncSession, project_id: uuid.UUID) -> CreatedReadKey:
+    plaintext = READ_KEY_PREFIX + secrets.token_urlsafe(24)
+    key = ReadKey(project_id=project_id, prefix=plaintext[:11], key_hash=hash_key(plaintext))
+    async with session.begin():
+        session.add(key)
+    return CreatedReadKey(key.id, plaintext)
+
+
+async def revoke_read_key(session: AsyncSession, read_key_id: uuid.UUID) -> None:
+    async with session.begin():
+        await session.execute(
+            update(ReadKey).where(ReadKey.id == read_key_id).values(revoked_at=datetime.now(UTC))
+        )
+
+
+async def authenticate_read_key(plaintext: str) -> uuid.UUID:
+    """No cache here, unlike write keys: a leaked read key exposes data, so
+    revocation must be instant. One indexed lookup is negligible next to the
+    analytical query that follows it."""
+    async with SessionLocal() as session:
+        key = await write_keys_repo.get_active_read_key(session, hash_key(plaintext))
+    if key is None:
+        raise Unauthenticated("Invalid or revoked read key")
+    return key.project_id
 
 
 async def revoke_write_key(session: AsyncSession, write_key_id: uuid.UUID) -> None:

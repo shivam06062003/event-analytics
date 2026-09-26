@@ -15,6 +15,8 @@ from app.services.errors import (
     DomainError,
     IngestUnavailable,
     NoValidEvents,
+    QueryTimeout,
+    QueryTooExpensive,
     Unauthenticated,
 )
 
@@ -23,6 +25,8 @@ _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     BatchTooLarge: status.HTTP_422_UNPROCESSABLE_CONTENT,
     NoValidEvents: status.HTTP_400_BAD_REQUEST,
     IngestUnavailable: status.HTTP_503_SERVICE_UNAVAILABLE,
+    QueryTimeout: status.HTTP_504_GATEWAY_TIMEOUT,
+    QueryTooExpensive: status.HTTP_422_UNPROCESSABLE_CONTENT,
 }
 INGEST_RETRY_AFTER_SECONDS = 5
 

@@ -35,3 +35,23 @@ class WriteKey(Base):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReadKey(Base):
+    """Credential for QUERYING one project's data.
+
+    Separate from write keys on purpose: write keys ship inside apps and web
+    pages (effectively public), so they must never be able to read anything.
+    Read keys live on servers and dashboards only. Never cached, so revoking
+    one takes effect immediately.
+    """
+
+    __tablename__ = "read_keys"
+    __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id"), index=True)
+    prefix: Mapped[str] = mapped_column(String(16))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

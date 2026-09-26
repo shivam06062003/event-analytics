@@ -35,3 +35,11 @@ class IngestUnavailable(DomainError):
     retry the same batch (same event_ids) after Retry-After."""
 
     code = "ingest_unavailable"
+
+
+class QueryTimeout(DomainError):
+    code = "query_timeout"
+
+
+class QueryTooExpensive(DomainError):
+    code = "query_too_expensive"
