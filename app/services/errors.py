@@ -37,6 +37,14 @@ class IngestUnavailable(DomainError):
     code = "ingest_unavailable"
 
 
+class QuotaExceeded(DomainError):
+    code = "quota_exceeded"
+
+    def __init__(self, message: str, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class QueryTimeout(DomainError):
     code = "query_timeout"
 

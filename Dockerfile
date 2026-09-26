@@ -18,8 +18,10 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY clickhouse/migrations ./clickhouse/migrations
 COPY clickhouse/seed ./clickhouse/seed
+COPY scripts/serve.sh ./serve.sh
 USER appuser
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+# serve.sh: $WEB_CONCURRENCY uvicorn processes + Prometheus multiprocess dir.
+CMD ["./serve.sh"]

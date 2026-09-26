@@ -58,6 +58,20 @@ class Settings(BaseSettings):
     query_cache_ttl_recent_seconds: int = 30
     query_cache_ttl_historical_seconds: int = 3_600
 
+    # Per-project quotas (token buckets in Redis). Ingestion is charged PER
+    # EVENT, not per request, so batching can't be used to dodge the limit.
+    quota_enabled: bool = True
+    ingest_quota_events_per_second: float = 5_000.0
+    ingest_quota_burst: int = 50_000
+    query_quota_per_second: float = 2.0
+    query_quota_burst: int = 20
+
+    # Observability
+    processor_metrics_port: int = 9100
+    otel_enabled: bool = False
+    otel_service_name: str = "event-api"
+    otel_exporter_otlp_endpoint: str = "http://localhost:4318/v1/traces"
+
     # Ingestion limits
     max_request_bytes: int = 1_000_000
     max_batch_events: int = 500

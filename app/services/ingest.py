@@ -7,6 +7,7 @@ is down: Kafka buffers them until the processors catch up.
 """
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -18,10 +19,18 @@ from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaError
 from pydantic import ValidationError
 
+from app.core import quota
 from app.core.config import get_settings
+from app.core.metrics import (
+    INGEST_BATCH_SIZE,
+    INGEST_EVENTS,
+    KAFKA_PRODUCE_DURATION,
+    QUOTA_REJECTIONS,
+)
+from app.core.tracing import kafka_headers
 from app.schemas.events import BatchRequest, RejectedEvent, TrackEvent
 from app.services import tracking_plans
-from app.services.errors import BatchTooLarge, IngestUnavailable, NoValidEvents
+from app.services.errors import BatchTooLarge, IngestUnavailable, NoValidEvents, QuotaExceeded
 
 logger = structlog.get_logger()
 
@@ -79,7 +88,11 @@ def build_message(
     received_at: datetime,
     ip: str | None,
     violations: list[str] | None = None,
+    received_at_iso: str | None = None,
+    sent_at_iso: str | None = None,
 ) -> bytes:
+    """received_at_iso/sent_at_iso: pre-formatted once per batch by the caller
+    (identical for every event in it)."""
     settings = get_settings()
     message: dict[str, Any] = {
         # Consumers branch on this when the format evolves, so old and new
@@ -98,8 +111,8 @@ def build_message(
             timedelta(seconds=settings.max_future_skew_seconds),
         ).isoformat(),
         "client_timestamp": event.timestamp.isoformat() if event.timestamp else None,
-        "sent_at": sent_at.isoformat() if sent_at else None,
-        "received_at": received_at.isoformat(),
+        "sent_at": sent_at_iso or (sent_at.isoformat() if sent_at else None),
+        "received_at": received_at_iso or received_at.isoformat(),
         "ip": ip,
         "properties": event.properties,
         "context": event.context,
@@ -142,8 +155,22 @@ async def ingest_batch(
     ip: str | None,
 ) -> IngestResult:
     settings = get_settings()
+    INGEST_BATCH_SIZE.observe(len(request.batch))
     if len(request.batch) > settings.max_batch_events:
         raise BatchTooLarge(len(request.batch), settings.max_batch_events)
+
+    # Charged per EVENT before any work: a tenant over quota costs us almost
+    # nothing, and a 500-event batch counts as 500, not 1.
+    ingest_quota = quota.get("ingest")
+    if ingest_quota is not None:
+        charge = await ingest_quota.charge(str(project_id), cost=len(request.batch))
+        if not charge.allowed:
+            INGEST_EVENTS.labels("rejected_quota").inc(len(request.batch))
+            QUOTA_REJECTIONS.labels("ingest").inc()
+            raise QuotaExceeded(
+                "Project event quota exceeded; retry after the indicated delay",
+                charge.retry_after_seconds,
+            )
 
     # Partial acceptance: one malformed event (an SDK bug, a bad property)
     # must not make the client drop or endlessly retry 499 good ones.
@@ -166,9 +193,16 @@ async def ingest_batch(
         else:
             checked.append((event, problems))
     rejected.sort(key=lambda r: r.index)
+    plan_rejections = len(valid) - len(checked)
+    INGEST_EVENTS.labels("rejected_validation").inc(len(request.batch) - len(valid))
+    INGEST_EVENTS.labels("rejected_plan").inc(plan_rejections)
     if not checked:
         raise NoValidEvents([r.model_dump() for r in rejected])
 
+    headers = kafka_headers()  # the request's trace context, carried in Kafka headers
+    received_at_iso = received_at.isoformat()
+    sent_at_iso = request.sent_at.isoformat() if request.sent_at else None
+    started = time.perf_counter()
     try:
         # send() only enqueues into the producer's buffer (and blocks if the
         # buffer is full: natural backpressure). The returned futures resolve
@@ -184,8 +218,11 @@ async def ingest_batch(
                     received_at=received_at,
                     ip=ip,
                     violations=problems,
+                    received_at_iso=received_at_iso,
+                    sent_at_iso=sent_at_iso,
                 ),
                 key=partition_key(project_id, event.distinct_id),
+                headers=headers,
             )
             for event, problems in checked
         ]
@@ -199,4 +236,6 @@ async def ingest_batch(
         logger.warning("ingest_unavailable", error=repr(exc), events=len(checked))
         raise IngestUnavailable("Event log unavailable; retry the batch shortly") from exc
 
+    KAFKA_PRODUCE_DURATION.observe(time.perf_counter() - started)
+    INGEST_EVENTS.labels("accepted").inc(len(checked))
     return IngestResult(accepted=len(checked), rejected=rejected)

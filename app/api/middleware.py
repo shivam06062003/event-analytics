@@ -8,10 +8,11 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from app.api.errors import error_response
 from app.core.config import get_settings
+from app.core.metrics import HTTP_DURATION, HTTP_REQUESTS
 
 REQUEST_ID_HEADER = "X-Request-ID"
 _VALID_REQUEST_ID = re.compile(r"^[A-Za-z0-9\-_.]{1,128}$")
-_UNLOGGED_PATHS = frozenset({"/health/live", "/health/ready"})
+_UNLOGGED_PATHS = frozenset({"/health/live", "/health/ready", "/metrics"})
 
 logger = structlog.get_logger()
 
@@ -29,9 +30,11 @@ async def request_context_middleware(
     try:
         response = await call_next(request)
     except Exception:
+        _observe(request, 500, start)
         logger.exception("request_failed", method=request.method, path=request.url.path)
         raise
 
+    _observe(request, response.status_code, start)
     response.headers[REQUEST_ID_HEADER] = request_id
     if request.url.path not in _UNLOGGED_PATHS:
         logger.info(
@@ -42,6 +45,13 @@ async def request_context_middleware(
             duration_ms=round((time.perf_counter() - start) * 1000, 2),
         )
     return response
+
+
+def _observe(request: Request, status_code: int, start: float) -> None:
+    # Route TEMPLATE (/v1/query/{kind}), never the raw path: bounded cardinality.
+    template = getattr(request.scope.get("route"), "path", "unmatched")
+    HTTP_REQUESTS.labels(request.method, template, str(status_code)).inc()
+    HTTP_DURATION.labels(request.method, template).observe(time.perf_counter() - start)
 
 
 async def body_size_limit_middleware(

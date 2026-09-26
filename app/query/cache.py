@@ -23,6 +23,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.core.config import get_settings
+from app.core.metrics import QUERY_CACHE
 
 logger = structlog.get_logger()
 
@@ -60,11 +61,15 @@ async def get_or_compute(
             logger.warning("query_cache_unavailable", error=str(exc))  # fail open: just compute
             raw = None
         if raw is not None:
+            QUERY_CACHE.labels("hit").inc()
             return orjson.loads(raw), True
 
     inflight = _inflight.get(key)
     if inflight is not None:
+        QUERY_CACHE.labels("coalesced").inc()
         return await asyncio.shield(inflight), False
+
+    QUERY_CACHE.labels("miss").inc()
 
     future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
     _inflight[key] = future

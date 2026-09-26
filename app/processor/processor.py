@@ -10,13 +10,28 @@ processed without having been stored.
 """
 
 import asyncio
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import CommitFailedError
+from opentelemetry.trace import SpanKind
 
 from app.core.config import Settings
+from app.core.metrics import (
+    END_TO_END_LATENCY,
+    PROCESSOR_BATCHES,
+    PROCESSOR_DEAD_LETTERS,
+    PROCESSOR_DUPLICATES,
+    PROCESSOR_INSERT_DURATION,
+    PROCESSOR_LAG,
+    PROCESSOR_ROWS,
+    PROCESSOR_SINK_FAILURES,
+)
+from app.core.tracing import links_from_headers, tracer
 from app.processor.dedup import Deduplicator
 from app.processor.sink import Sink
 from app.processor.transform import DeadLetter, EventRow, parse
@@ -69,7 +84,19 @@ class Processor:
         )
         records = [record for partition_records in batches.values() for record in partition_records]
         if not records:
+            await self._update_lag_metric()
             return BatchResult()
+        # One CONSUMER span per batch, LINKED to the ingestion request(s) that
+        # produced its messages (a span has one parent, a batch has many).
+        with tracer.start_as_current_span(
+            "process events batch",
+            kind=SpanKind.CONSUMER,
+            links=links_from_headers([record.headers or () for record in records]),
+            attributes={"messaging.batch.message_count": len(records)},
+        ):
+            return await self._process(records)
+
+    async def _process(self, records: list[Any]) -> BatchResult:  # aiokafka is untyped
 
         rows: list[EventRow] = []
         dead: list[DeadLetter] = []
@@ -87,6 +114,14 @@ class Processor:
             await self._send_dead_letters(dead)
         await self.dedup.mark(new_rows)
         committed = await self._commit()
+
+        PROCESSOR_BATCHES.inc()
+        PROCESSOR_ROWS.inc(len(new_rows))
+        PROCESSOR_DUPLICATES.inc(duplicates)
+        stored_at = datetime.now(UTC)
+        for row in new_rows:
+            END_TO_END_LATENCY.observe((stored_at - row.received_at).total_seconds())
+        await self._update_lag_metric()
 
         result = BatchResult(len(records), len(new_rows), duplicates, len(dead), committed)
         logger.info(
@@ -110,9 +145,15 @@ class Processor:
         """
         attempt = 0
         while True:
+            started = time.perf_counter()
             try:
-                await self.sink.insert(rows)
+                with tracer.start_as_current_span(
+                    "clickhouse insert", attributes={"rows": len(rows)}
+                ):
+                    await self.sink.insert(rows)
+                PROCESSOR_INSERT_DURATION.observe(time.perf_counter() - started)
             except Exception as exc:
+                PROCESSOR_SINK_FAILURES.inc()
                 attempt += 1
                 delay = min(self.settings.processor_retry_max_backoff_seconds, 0.5 * 2**attempt)
                 assigned = self.consumer.assignment()
@@ -147,6 +188,7 @@ class Processor:
         ]
         await asyncio.gather(*pending)
         for letter in dead:
+            PROCESSOR_DEAD_LETTERS.labels(letter.reason.split(":")[0]).inc()
             logger.warning(
                 "dead_lettered",
                 reason=letter.reason,
@@ -163,6 +205,13 @@ class Processor:
             # It will re-read from the last commit: duplicates, handled downstream.
             logger.warning("commit_failed_after_rebalance", error=str(exc))
             return False
+
+    async def _update_lag_metric(self) -> None:
+        for partition in self.consumer.assignment():
+            highwater = self.consumer.highwater(partition)
+            if highwater is not None:
+                behind = max(0, highwater - await self.consumer.position(partition))
+                PROCESSOR_LAG.labels(str(partition.partition)).set(behind)
 
     async def lag(self) -> int:
         """Messages in our partitions not yet consumed: the key health metric

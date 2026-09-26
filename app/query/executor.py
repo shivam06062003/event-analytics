@@ -4,6 +4,7 @@ Every query gets hard per-query limits. One user asking for a year of
 unfiltered data must not starve every other tenant on the cluster.
 """
 
+import time
 from typing import Any
 
 import structlog
@@ -11,6 +12,7 @@ from clickhouse_connect.driver.asyncclient import AsyncClient
 from clickhouse_connect.driver.exceptions import DatabaseError
 
 from app.core.config import get_settings
+from app.core.metrics import QUERY_DURATION
 from app.services.errors import QueryTimeout, QueryTooExpensive
 
 logger = structlog.get_logger()
@@ -29,8 +31,9 @@ def get_client() -> AsyncClient:
     return _client
 
 
-async def run(sql: str, params: dict[str, Any]) -> list[tuple[Any, ...]]:
+async def run(sql: str, params: dict[str, Any], kind: str = "other") -> list[tuple[Any, ...]]:
     settings = get_settings()
+    started = time.perf_counter()
     try:
         result = await get_client().query(
             sql,
@@ -56,4 +59,6 @@ async def run(sql: str, params: dict[str, Any]) -> list[tuple[Any, ...]]:
                 "Query needs too much memory; narrow the time range or reduce breakdowns"
             ) from exc
         raise
+    finally:
+        QUERY_DURATION.labels(kind).observe(time.perf_counter() - started)
     return [tuple(row) for row in result.result_rows]

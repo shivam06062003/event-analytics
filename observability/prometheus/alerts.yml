@@ -1,0 +1,46 @@
+groups:
+  - name: event-analytics
+    rules:
+      - alert: ConsumerLagGrowing
+        expr: sum(processor_consumer_lag) > 50000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Processors are falling behind ingestion. Scale out (up to one replica per partition).
+
+      - alert: EventsNotBecomingQueryable
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(event_ingest_to_stored_seconds_bucket[5m]))) > 60
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: p95 ingest-to-queryable latency is above 60s; users will see stale dashboards.
+
+      - alert: ClickHouseInsertsFailing
+        expr: sum(rate(processor_sink_failures_total[5m])) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: ClickHouse inserts are failing. Events are buffering in Kafka (no data loss yet).
+
+      - alert: DeadLettersArriving
+        expr: sum(rate(processor_dead_letters_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Messages are going to events.dlq. Inspect with `rpk topic consume events.dlq`.
+
+      - alert: IngestionErrors
+        expr: |
+          sum(rate(http_requests_total{route="/v1/batch", status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{route="/v1/batch"}[5m])) > 0.01
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: More than 1% of ingestion requests fail. Clients will retry and back up.
+
+      - alert: QuotaBackendDown
+        expr: sum(rate(quota_backend_errors_total[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Quota checks are failing open (Redis unreachable); tenants are unthrottled.

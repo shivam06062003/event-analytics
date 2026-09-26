@@ -7,7 +7,7 @@ send user events. The platform ingests them at high volume through Kafka,
 processes them, and answers funnel, retention and segmentation queries from
 ClickHouse.
 
-> **Status:** Phase 4 (identity, sessions, tracking plans) complete. See [Roadmap](#roadmap) and [benchmarks](#benchmarks).
+> **Status:** Phase 5 (operability) complete. See [Roadmap](#roadmap) and [benchmarks](#benchmarks).
 
 ## Architecture
 
@@ -28,9 +28,29 @@ Dashed components arrive in later phases. Design rationale:
 [ADR 0001](docs/adr/0001-architecture-and-ingestion.md) (architecture and ingestion) and
 [ADR 0002](docs/adr/0002-stream-processing-and-deduplication.md) (processing and dedup),
 [ADR 0003](docs/adr/0003-query-api.md) (query API),
-[ADR 0004](docs/adr/0004-identity-sessions-tracking-plans.md) (identity, sessions, tracking plans).
+[ADR 0004](docs/adr/0004-identity-sessions-tracking-plans.md) (identity, sessions, tracking plans),
+[ADR 0005](docs/adr/0005-operability-and-load-testing.md) (metrics, tracing, quotas, load testing).
 
 ## Highlights
+
+### Operability (Phase 5)
+
+- **Prometheus metrics that matter.** Consumer lag per partition,
+  **ingest-to-queryable latency**, events by outcome, Kafka ack time, and
+  query latency and cache hits. Labels stay low-cardinality (route templates,
+  no per-tenant labels). There's a provisioned Grafana dashboard and 6 alert
+  rules validated in CI.
+- **Tracing across Kafka.** The `traceparent` travels in message headers, and
+  the processor's batch span carries **span links** to every request whose
+  events it stored. This was verified in Jaeger.
+- **Per-project quotas charged per event** (Lua token bucket in Redis), so
+  batching can't multiply a tenant's allowance. There's a separate query
+  quota, and both fail open with an alert.
+- **Load tested with a documented bottleneck hunt.** The limit moved from API
+  CPU (fixed with a memoized, Kafka-compatible partitioner), to the load
+  generator, to the broker. The best run was **~17.4k events/s sustained, 0
+  failures**. Scaling consumers on a single laptop starved the broker, and
+  the ADR records that honestly.
 
 ### Identity, sessions, tracking plans (Phase 4)
 
@@ -222,6 +242,23 @@ M1 laptop stack with ClickHouse capped at 1.2 GB:
 
 Details are in [ADR 0003](docs/adr/0003-query-api.md#measured).
 
+### Observability
+
+```bash
+make observability       # stack + Prometheus :9091, Grafana :3002, Jaeger :16687 (tracing on)
+make loadtest vus=16 batch=500 duration=40s
+```
+
+### Ingestion load test (M1 laptop, everything in one Docker VM)
+
+| Setup | Throughput | Errors |
+|---|---|---|
+| Broker 2 cores / 1 GB, 1 processor, 500-event batches | **~17.4k events/s** sustained | 0 |
+| Broker 1 core / 512 MB | ~6.6k events/s (Kafka ack p95 ≥ 1 s) | 0 |
+| 3 processors on the same laptop | collapsed (broker starved of CPU) | 16–22% |
+
+Details are in [ADR 0005](docs/adr/0005-operability-and-load-testing.md).
+
 ## Project layout
 
 ```
@@ -245,5 +282,5 @@ docs/adr/         Architecture Decision Records
 - [x] **Phase 2: Processing.** Consumer group writes to ClickHouse, two-layer dedup, dead-letter topic, commit after write, pause-based backpressure, lag.
 - [x] **Phase 3: Query API.** Segmentation, funnels, retention, read keys, injection-proof SQL, guard rails, caching with coalescing.
 - [x] **Phase 4: Sessions and schemas.** Retroactive identity merge, query-time sessionization, versioned tracking plans with breaking-change protection.
-- [ ] **Phase 5: Operability.** Metrics, tracing, per-project quotas, load test (target: 20k+ events/s).
+- [x] **Phase 5: Operability.** Metrics, alerts and dashboard; tracing across Kafka; per-event quotas; load test (~17.4k events/s on a laptop, bottlenecks documented).
 - [ ] **Phase 6: Kubernetes.** kind + Helm, KEDA autoscaling on consumer lag.

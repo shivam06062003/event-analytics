@@ -6,12 +6,14 @@ import signal
 from pathlib import Path
 
 import structlog
+from prometheus_client import start_http_server
 from redis.asyncio import Redis
 
 from app.core.clickhouse import create_client
 from app.core.config import get_settings
 from app.core.kafka import build_producer
 from app.core.logging import configure_logging
+from app.core.tracing import configure_tracing
 from app.processor.dedup import Deduplicator
 from app.processor.processor import Processor, build_consumer
 from app.processor.sink import ClickHouseSink
@@ -22,6 +24,9 @@ logger = structlog.get_logger()
 async def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
+    configure_tracing(settings)
+    # The processor has no web framework; Prometheus scrapes this port.
+    start_http_server(settings.processor_metrics_port)
 
     consumer = build_consumer(settings)
     producer = build_producer(settings)

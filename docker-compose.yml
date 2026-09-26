@@ -8,6 +8,9 @@ x-app-env: &app-env
   ENVIRONMENT: local
   LOG_LEVEL: INFO
   LOG_JSON: "true"
+  QUOTA_ENABLED: ${QUOTA_ENABLED:-true}
+  OTEL_ENABLED: ${OTEL_ENABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
 
 services:
   postgres:
@@ -27,15 +30,16 @@ services:
       retries: 15
 
   # Kafka-API-compatible broker: one binary, no ZooKeeper/KRaft controller to
-  # run, and a small memory footprint (capped at 512MB here for an 8GB laptop).
+  # run, and a small memory footprint. 2 cores / 1GB by default: with 1 core /
+  # 512MB it became the ingestion bottleneck under load (see ADR 0005).
   redpanda:
     image: redpandadata/redpanda:v25.2.9
     command:
       - redpanda
       - start
       - --mode=dev-container
-      - --smp=1
-      - --memory=512M
+      - --smp=${REDPANDA_CORES:-2}
+      - --memory=${REDPANDA_MEMORY:-1G}
       - --default-log-level=warn
       # Two listeners: containers use redpanda:9092, the host (tests) uses localhost:19092.
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
@@ -103,7 +107,12 @@ services:
   api:
     build: .
     restart: unless-stopped
-    environment: *app-env
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: event-api
+      # Python runs one thread at a time per process: use several processes.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
     ports:
       - "8001:8000"
     depends_on:
@@ -116,7 +125,9 @@ services:
     build: .
     command: ["python", "-m", "app.processor"]
     restart: unless-stopped
-    environment: *app-env
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: event-processor
     healthcheck:
       test:
         - CMD
@@ -144,6 +155,37 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+
+  # ---- Observability (optional): `make observability` ----------------------
+  # Host ports differ from the ledger project's (9090/3001/16686) so both
+  # stacks can run side by side.
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+    ports:
+      - "9091:9090"
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3002:3000"
+
+  jaeger:
+    profiles: [observability]
+    image: jaegertracing/jaeger:2.9.0
+    ports:
+      - "16687:16686"
 
 volumes:
   pgdata:

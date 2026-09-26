@@ -1,14 +1,36 @@
 """Kafka (Redpanda) producer and topic management."""
 
+import random
+from functools import lru_cache
+
 import structlog
 from aiokafka import AIOKafkaProducer
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.partitioner import murmur2
 
 from app.core.config import Settings, get_settings
 
 logger = structlog.get_logger()
 
 _producer: AIOKafkaProducer | None = None
+
+
+@lru_cache(maxsize=200_000)
+def _murmur2(key: bytes) -> int:
+    return int(murmur2(key)) & 0x7FFFFFFF
+
+
+def cached_partitioner(key: bytes | None, all_partitions: list[int], available: list[int]) -> int:
+    """Kafka's default partitioner (murmur2, identical to the Java client, so
+    any producer agrees on key -> partition), with the hash memoized.
+
+    aiokafka computes murmur2 in pure Python: ~13us per message, the single
+    biggest cost in our ingestion profile. Keys are `project:user`, and
+    active users send many events, so most lookups are cache hits.
+    """
+    if key is None:
+        return random.choice(available or all_partitions)
+    return all_partitions[_murmur2(key) % len(all_partitions)]
 
 
 def build_producer(settings: Settings) -> AIOKafkaProducer:
@@ -25,6 +47,7 @@ def build_producer(settings: Settings) -> AIOKafkaProducer:
         # fewer, larger requests under load, for a tiny latency cost.
         linger_ms=5,
         request_timeout_ms=int(settings.kafka_send_timeout_seconds * 1000),
+        partitioner=cached_partitioner,
     )
 
 

@@ -5,6 +5,8 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.api.auth import ReadKeyProject
+from app.core import quota
+from app.core.metrics import QUOTA_REJECTIONS
 from app.query import cache, queries
 from app.schemas.queries import (
     EventNameCount,
@@ -17,6 +19,7 @@ from app.schemas.queries import (
     SessionsQuery,
     SessionsResult,
 )
+from app.services.errors import QuotaExceeded
 
 router = APIRouter(prefix="/v1", tags=["queries"])
 
@@ -24,6 +27,13 @@ router = APIRouter(prefix="/v1", tags=["queries"])
 async def _cached(
     project_id: str, kind: str, query: BaseModel, range_end: datetime, compute: Any
 ) -> dict[str, Any]:
+    query_quota = quota.get("query")
+    if query_quota is not None:
+        charge = await query_quota.charge(project_id)
+        if not charge.allowed:
+            QUOTA_REJECTIONS.labels("query").inc()
+            raise QuotaExceeded("Project query quota exceeded", charge.retry_after_seconds)
+
     async def run() -> dict[str, Any]:
         result: dict[str, Any] = await compute(project_id, query)
         result["computed_at"] = datetime.now(UTC).isoformat()

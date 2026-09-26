@@ -82,7 +82,7 @@ async def segmentation(project_id: str, q: SegmentationQuery) -> dict[str, Any]:
         FROM {source}
         GROUP BY bucket, segment
     """
-    rows = await executor.run(sql, params.values)
+    rows = await executor.run(sql, params.values, kind="segmentation")
 
     all_buckets = buckets(q.from_, q.to, q.interval)
     per_segment: dict[str, dict[datetime, int]] = {}
@@ -154,7 +154,7 @@ async def funnel(project_id: str, q: FunnelQuery) -> dict[str, Any]:
         WHERE level > 0
         GROUP BY level
     """
-    rows = await executor.run(sql, params.values)
+    rows = await executor.run(sql, params.values, kind="funnel")
     users_at_level = {int(level): int(users) for level, users in rows}
 
     # windowFunnel returns the deepest step reached; users reaching step i are
@@ -212,7 +212,7 @@ async def retention(project_id: str, q: RetentionQuery) -> dict[str, Any]:
         -- offset -1 carries each cohort's size.
         SELECT cohort, -1, count() FROM cohorts GROUP BY cohort
     """
-    rows = await executor.run(sql, params.values)
+    rows = await executor.run(sql, params.values, kind="retention")
 
     sizes: dict[datetime, int] = {}
     retained: dict[datetime, dict[int, int]] = {}
@@ -294,7 +294,7 @@ async def sessions(project_id: str, q: SessionsQuery) -> dict[str, Any]:
         WHERE started >= {start} AND started < {end}
         GROUP BY bucket
     """
-    rows = await executor.run(sql, params.values)
+    rows = await executor.run(sql, params.values, kind="sessions")
     by_bucket = {_as_utc(r[0]): r for r in rows}
 
     points = []
@@ -349,7 +349,10 @@ async def event_names(project_id: str, days: int) -> list[dict[str, Any]]:
         WHERE {where}
         GROUP BY event ORDER BY n DESC LIMIT 500
     """
-    return [{"event": e, "count": int(n)} for e, n in await executor.run(sql, params.values)]
+    return [
+        {"event": e, "count": int(n)}
+        for e, n in await executor.run(sql, params.values, kind="event_names")
+    ]
 
 
 def _rate(part: int, whole: int) -> float:
@@ -369,5 +372,5 @@ async def violation_counts(project_id: str, days: int) -> list[dict[str, Any]]:
         ORDER BY n DESC
         LIMIT 200
     """
-    rows = await executor.run(sql, params.values)
+    rows = await executor.run(sql, params.values, kind="violations")
     return [{"event": e, "violation": v, "count": int(n)} for e, v, n in rows]

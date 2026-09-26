@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: event-api
+    static_configs:
+      - targets: ["api:8000"]
+  # DNS discovery finds every processor replica (`--scale processor=3`).
+  - job_name: event-processor
+    dns_sd_configs:
+      - names: ["processor"]
+        type: A
+        port: 9100

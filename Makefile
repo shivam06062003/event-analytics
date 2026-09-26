@@ -1,4 +1,4 @@
-.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check read-key seed
+.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check read-key seed observability loadtest
 
 install:        ## Create venv and install app + dev tools
 	python3.13 -m venv .venv
@@ -62,3 +62,14 @@ read-key:       ## Create a read (query) key: make read-key project=<project id>
 
 seed:           ## Demo data straight into ClickHouse: make seed project=<id> [users=200000]
 	@docker compose exec -T api python -m app.cli seed-demo --project "$(project)" --users $(or $(users),200000)
+
+observability:  ## Stack + Prometheus (:9091), Grafana (:3002), Jaeger (:16687), tracing on
+	OTEL_ENABLED=true docker compose --profile observability up -d --build
+
+loadtest:       ## Ingestion load test: make loadtest [vus=40 | rate=250] batch=100 duration=30s
+	@QUOTA_ENABLED=false docker compose up -d api >/dev/null 2>&1; sleep 6
+	@KEY=$$(docker compose exec -T api python -m app.cli create-project --name "loadtest" 2>/dev/null); \
+	docker run --rm --network event-analytics_default -v "$(CURDIR)/loadtest:/scripts:ro" grafana/k6:1.2.3 run \
+		-e WRITE_KEY=$$KEY -e BATCH=$(or $(batch),100) -e VUS=$(or $(vus),40) $(if $(rate),-e RATE=$(rate)) \
+		-e DURATION=$(or $(duration),30s) /scripts/ingest.js
+	@docker compose up -d api >/dev/null 2>&1   # quotas back on

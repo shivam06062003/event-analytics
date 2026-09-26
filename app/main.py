@@ -1,18 +1,21 @@
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, multiprocess
 from redis.asyncio import Redis
 
 from app.api.errors import register_error_handlers
 from app.api.middleware import body_size_limit_middleware, request_context_middleware
 from app.api.routes import health, ingest, query, tracking_plan
-from app.core import clickhouse
+from app.core import clickhouse, quota
 from app.core.config import get_settings
 from app.core.db import engine
 from app.core.kafka import start_producer, stop_producer
 from app.core.logging import configure_logging
+from app.core.tracing import configure_tracing
 from app.query import cache, executor
 
 logger = structlog.get_logger()
@@ -26,6 +29,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     executor.set_client(ch_client)
     redis = Redis.from_url(settings.redis_url, socket_timeout=0.5, socket_connect_timeout=0.5)
     cache.set_redis(redis)
+    quota.configure(redis, settings)
     logger.info("startup", environment=settings.environment)
     yield
     await ch_client.close()
@@ -50,6 +54,18 @@ def create_app() -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(query.router)
     app.include_router(tracking_plan.router)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        # Internal-network only in production (unauthenticated, like /health).
+        if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+            # Several uvicorn worker processes: merge every process's metrics.
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry)  # type: ignore[no-untyped-call]
+            return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    configure_tracing(settings, app)
     return app
 
 

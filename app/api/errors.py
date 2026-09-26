@@ -1,5 +1,6 @@
 """One error shape everywhere:  {"error": {"code", "message", "details"?}}"""
 
+import math
 from collections.abc import Mapping
 from http import HTTPStatus
 from typing import Any
@@ -20,6 +21,7 @@ from app.services.errors import (
     NoValidEvents,
     QueryTimeout,
     QueryTooExpensive,
+    QuotaExceeded,
     Unauthenticated,
 )
 
@@ -33,6 +35,7 @@ _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     Forbidden: status.HTTP_403_FORBIDDEN,
     NotFound: status.HTTP_404_NOT_FOUND,
     BreakingChange: status.HTTP_409_CONFLICT,
+    QuotaExceeded: status.HTTP_429_TOO_MANY_REQUESTS,
 }
 INGEST_RETRY_AFTER_SECONDS = 5
 
@@ -57,6 +60,8 @@ async def _domain_error_handler(request: Request, exc: Exception) -> JSONRespons
         headers = {"WWW-Authenticate": "Bearer"}
     elif isinstance(exc, IngestUnavailable):
         headers = {"Retry-After": str(INGEST_RETRY_AFTER_SECONDS)}
+    elif isinstance(exc, QuotaExceeded) and math.isfinite(exc.retry_after_seconds):
+        headers = {"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))}
     return error_response(
         _STATUS_BY_ERROR.get(type(exc), status.HTTP_400_BAD_REQUEST),
         exc.code,

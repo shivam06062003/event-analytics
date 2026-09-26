@@ -215,3 +215,18 @@ async def test_202_waits_for_broker_acknowledgement(
     response = await client.post("/v1/batch", json={"batch": [event()]}, headers=project.headers)
 
     assert response.status_code == 503
+
+
+def test_cached_partitioner_matches_kafkas_default_partitioner() -> None:
+    """Memoizing must not change the key -> partition mapping (other Kafka
+    clients producing to the topic must agree with us)."""
+    from aiokafka.partitioner import DefaultPartitioner
+
+    from app.core.kafka import cached_partitioner
+
+    partitions = list(range(6))
+    for i in range(2_000):
+        key = f"project-{i % 7}:user-{i}".encode()
+        assert cached_partitioner(key, partitions, partitions) == DefaultPartitioner()(
+            key, partitions, partitions
+        )

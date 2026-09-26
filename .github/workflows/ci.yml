@@ -87,6 +87,16 @@ jobs:
         run: alembic upgrade head && alembic downgrade base && alembic upgrade head && alembic check
       - run: pytest -v
 
+  observability-config:
+    name: Validate Prometheus config & alerts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          docker run --rm --entrypoint promtool
+          -v "$PWD/observability/prometheus:/p:ro"
+          prom/prometheus:v3.5.0 check config /p/prometheus.yml
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

@@ -398,11 +398,13 @@ async def test_identical_concurrent_queries_run_once(
     calls = 0
     real_run = executor.run
 
-    async def slow_counting_run(sql: str, params: dict[str, Any]) -> list[tuple[Any, ...]]:
+    async def slow_counting_run(
+        sql: str, params: dict[str, Any], kind: str = "other"
+    ) -> list[tuple[Any, ...]]:
         nonlocal calls
         calls += 1
         await asyncio.sleep(0.3)
-        return await real_run(sql, params)
+        return await real_run(sql, params, kind)
 
     monkeypatch.setattr(executor, "run", slow_counting_run)
     body = {"event": "signup", **time_range(at(0), at(1))}

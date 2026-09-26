@@ -27,6 +27,12 @@ os.environ["CLICKHOUSE_MIGRATIONS_DIR"] = str(
 )
 os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:6381/14")
 os.environ["PROCESSOR_GROUP_ID"] = f"test-processor-{SESSION}"
+# Quotas on, but far above anything a test sends; test_quotas.py installs strict ones.
+os.environ["INGEST_QUOTA_EVENTS_PER_SECOND"] = "10000000"
+os.environ["INGEST_QUOTA_BURST"] = "10000000"
+os.environ["QUERY_QUOTA_PER_SECOND"] = "100000"
+os.environ["QUERY_QUOTA_BURST"] = "100000"
+os.environ["PROCESSOR_METRICS_PORT"] = "0"
 
 import asyncpg  # noqa: E402
 import orjson  # noqa: E402
@@ -38,6 +44,7 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
 
+from app.core import quota  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.db import SessionLocal, engine  # noqa: E402
 from app.core.kafka import ensure_topics, start_producer, stop_producer  # noqa: E402
@@ -77,6 +84,7 @@ class Message:
     key: str
     partition: int
     value: dict[str, Any]
+    headers: dict[str, str]
 
 
 class TopicCollector:
@@ -111,7 +119,12 @@ class TopicCollector:
             except (orjson.JSONDecodeError, KeyError, TypeError):
                 continue
             self.by_project[project_id].append(
-                Message((record.key or b"").decode(), record.partition, value)
+                Message(
+                    (record.key or b"").decode(),
+                    record.partition,
+                    value,
+                    {k: v.decode() for k, v in (record.headers or ())},
+                )
             )
 
     async def wait_for(
@@ -171,7 +184,8 @@ async def clean_state() -> None:
 
 
 @pytest.fixture
-async def client(kafka: TopicCollector) -> AsyncIterator[AsyncClient]:
+async def client(kafka: TopicCollector, redis: "Redis") -> AsyncIterator[AsyncClient]:
+    quota.configure(redis, get_settings())  # normally done in the app lifespan
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
 

@@ -109,8 +109,12 @@ async def test_poison_messages_go_to_the_dead_letter_topic(
     client: AsyncClient, project: ProjectFixture, processor: Processor, ch: ClickHouseClient
 ) -> None:
     producer = get_producer()
-    await producer.send_and_wait(TEST_TOPIC, b"{broken json", key=b"x")
-    await producer.send_and_wait(TEST_TOPIC, orjson.dumps({"schema_version": 7}), key=b"y")
+    # Unique keys: other tests also produce poison messages into this session's
+    # topic, so we only look at our own dead letters.
+    keys = {uuid.uuid4().hex.encode(), uuid.uuid4().hex.encode()}
+    broken_key, future_key = sorted(keys)
+    await producer.send_and_wait(TEST_TOPIC, b"{broken json", key=broken_key)
+    await producer.send_and_wait(TEST_TOPIC, orjson.dumps({"schema_version": 7}), key=future_key)
     await send(client, project, event(event="good"))
 
     await drain(processor)
@@ -118,7 +122,11 @@ async def test_poison_messages_go_to_the_dead_letter_topic(
     # The good event in the same stream is not held back by the bad ones...
     assert [r[1] for r in await rows_for(ch, project.id)] == ["good"]
     # ...and the bad ones are preserved with the reason, for inspection/replay.
-    letters = await read_topic(TEST_DLQ_TOPIC, expected=2)
+    letters = [
+        letter
+        for letter in await read_topic(TEST_DLQ_TOPIC, expected=2, key_filter=keys)
+        if letter.key in keys
+    ]
     reasons = sorted(dict(letter.headers)["error"].decode() for letter in letters)
     assert reasons == ["invalid_json", "unsupported_schema_version:7"]
     assert {letter.value for letter in letters} == {
@@ -235,7 +243,9 @@ async def committed_offsets(processor: Processor) -> dict[TopicPartition, int]:
     return offsets
 
 
-async def read_topic(topic: str, expected: int, wait_seconds: float = 10) -> list:
+async def read_topic(
+    topic: str, expected: int, wait_seconds: float = 10, key_filter: set[bytes] | None = None
+) -> list:
     consumer = AIOKafkaConsumer(
         topic,
         bootstrap_servers=get_settings().kafka_bootstrap_servers,
@@ -249,7 +259,9 @@ async def read_topic(topic: str, expected: int, wait_seconds: float = 10) -> lis
         while len(records) < expected and asyncio.get_running_loop().time() < deadline:
             batch = await consumer.getmany(timeout_ms=500)
             for partition_records in batch.values():
-                records.extend(partition_records)
+                records.extend(
+                    r for r in partition_records if key_filter is None or r.key in key_filter
+                )
     finally:
         await consumer.stop()
     return records
