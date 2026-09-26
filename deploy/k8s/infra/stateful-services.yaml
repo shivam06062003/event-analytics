@@ -1,0 +1,176 @@
+# LOCAL-CLUSTER backing services only. In production these are managed
+# services (RDS/Cloud SQL, MSK/Confluent/Redpanda Cloud, ClickHouse Cloud,
+# ElastiCache) or operator-managed clusters with replication, backups and
+# anti-affinity. Single replicas here, sized for an 8GB laptop.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: analytics}
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres, namespace: analytics}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - {name: POSTGRES_USER, value: analytics}
+            - {name: POSTGRES_PASSWORD, value: analytics}
+            - {name: POSTGRES_DB, value: analytics}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "analytics", "-d", "analytics"]}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: analytics}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: analytics}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--maxmemory", "96mb", "--maxmemory-policy", "volatile-ttl"]
+          ports: [{containerPort: 6379}]
+          readinessProbe:
+            exec: {command: ["redis-cli", "ping"]}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redpanda, namespace: analytics}
+spec:
+  selector: {app: redpanda}
+  ports: [{name: kafka, port: 9092}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: redpanda, namespace: analytics}
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector: {matchLabels: {app: redpanda}}
+  template:
+    metadata: {labels: {app: redpanda}}
+    spec:
+      containers:
+        - name: redpanda
+          image: redpandadata/redpanda:v25.2.9
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container
+            - --smp=1
+            - --memory=640M
+            - --default-log-level=warn
+            - --kafka-addr=0.0.0.0:9092
+            # Advertise the FULLY QUALIFIED name: clients in other namespaces
+            # (KEDA runs in `keda`) must be able to resolve the address the
+            # broker hands back in metadata. A short name like `redpanda`
+            # only resolves inside this namespace.
+            - --advertise-kafka-addr=redpanda.analytics.svc.cluster.local:9092
+          ports: [{containerPort: 9092}]
+          readinessProbe:
+            exec: {command: ["sh", "-c", "rpk cluster health | grep -E 'Healthy:.+true'"]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 500m, memory: 768Mi}
+            limits: {memory: 896Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/redpanda/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: clickhouse-config, namespace: analytics}
+data:
+  low-memory.xml: |
+    <clickhouse>
+        <max_server_memory_usage>700000000</max_server_memory_usage>
+        <mark_cache_size>134217728</mark_cache_size>
+        <logger><level>warning</level><console>1</console></logger>
+        <trace_log remove="1"/>
+        <metric_log remove="1"/>
+        <asynchronous_metric_log remove="1"/>
+        <query_thread_log remove="1"/>
+        <text_log remove="1"/>
+        <processors_profile_log remove="1"/>
+    </clickhouse>
+---
+apiVersion: v1
+kind: Service
+metadata: {name: clickhouse, namespace: analytics}
+spec:
+  selector: {app: clickhouse}
+  ports: [{name: http, port: 8123}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: clickhouse, namespace: analytics}
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector: {matchLabels: {app: clickhouse}}
+  template:
+    metadata: {labels: {app: clickhouse}}
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.8
+          env:
+            - {name: CLICKHOUSE_USER, value: analytics}
+            - {name: CLICKHOUSE_PASSWORD, value: analytics}
+            - {name: CLICKHOUSE_DB, value: analytics}
+            - {name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1"}
+          ports: [{containerPort: 8123}]
+          readinessProbe:
+            httpGet: {path: /ping, port: 8123}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 896Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/clickhouse}
+            - {name: config, mountPath: /etc/clickhouse-server/config.d/low-memory.xml, subPath: low-memory.xml}
+      volumes:
+        - {name: config, configMap: {name: clickhouse-config}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}

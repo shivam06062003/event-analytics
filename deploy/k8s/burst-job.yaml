@@ -1,0 +1,27 @@
+# In-cluster load burst that builds consumer lag so KEDA scales the processors.
+# Usage: make k8s-burst  (creates a project, then runs this Job with its key)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: burst
+  namespace: analytics
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:1.2.3
+          args: ["run", "-e", "BASE_URL=http://analytics-api", "-e", "BATCH=500",
+                 "-e", "VUS=8", "-e", "DURATION=45s", "/scripts/ingest.js"]
+          env:
+            - name: WRITE_KEY
+              valueFrom: {secretKeyRef: {name: burst-write-key, key: key}}
+          volumeMounts: [{name: scripts, mountPath: /scripts}]
+          resources:
+            limits: {cpu: "1", memory: 256Mi}
+      volumes:
+        - name: scripts
+          configMap: {name: loadtest-scripts}

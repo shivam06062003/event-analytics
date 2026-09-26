@@ -1,0 +1,70 @@
+# Production-shaped defaults. deploy/k8s/values-kind.yaml trims them for a laptop.
+
+image:
+  repository: event-analytics
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Non-secret configuration, rendered into a ConfigMap (env vars).
+config:
+  ENVIRONMENT: production
+  LOG_LEVEL: INFO
+  LOG_JSON: "true"
+  KAFKA_BOOTSTRAP_SERVERS: redpanda.analytics.svc.cluster.local:9092
+  RAW_EVENTS_PARTITIONS: "6"
+  CLICKHOUSE_HOST: clickhouse.analytics.svc.cluster.local
+  REDIS_URL: redis://redis.analytics.svc.cluster.local:6379/0
+  QUOTA_ENABLED: "true"
+
+# Secret configuration. For real deployments set `existingSecret` to a Secret
+# managed outside the chart (External Secrets, Vault, sealed-secrets); these
+# inline values are for local clusters only.
+existingSecret: ""
+secrets:
+  DATABASE_URL: postgresql+asyncpg://analytics:analytics@postgres.analytics.svc.cluster.local:5432/analytics
+  CLICKHOUSE_PASSWORD: analytics
+
+migrations:
+  enabled: true
+
+api:
+  # One uvicorn worker per pod: in Kubernetes, scale PODS (the scheduler, HPA
+  # and probes work per pod) instead of processes inside a pod.
+  webConcurrency: 1
+  replicas: 2
+  service:
+    port: 80
+  resources:
+    requests: {cpu: 250m, memory: 192Mi}
+    limits: {cpu: "1", memory: 384Mi}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    minAvailable: 1
+
+processor:
+  replicas: 1  # only used when KEDA autoscaling is disabled
+  resources:
+    requests: {cpu: 250m, memory: 128Mi}
+    limits: {cpu: "1", memory: 384Mi}
+  autoscaling:
+    # KEDA scales on Kafka consumer lag, the signal that actually means
+    # "processing can't keep up" (CPU is a poor proxy for a consumer).
+    enabled: true
+    minReplicas: 1
+    # More consumers than partitions sit idle: a partition is consumed by
+    # exactly one member of a group. Keep equal to RAW_EVENTS_PARTITIONS.
+    maxReplicas: 6
+    lagThreshold: "5000"      # target lag PER replica
+    pollingInterval: 5
+    # cooldownPeriod only governs scaling to ZERO. Scaling down between min
+    # and max is done by the HPA that KEDA creates, whose default scale-down
+    # stabilization window is 300s. Set it explicitly: long enough not to
+    # flap on bursty traffic, short enough to release idle capacity.
+    cooldownPeriod: 60
+    scaleDownStabilizationSeconds: 300
+    consumerGroup: event-processor
+    topic: events.raw

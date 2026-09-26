@@ -1,0 +1,7 @@
+Event Analytics {{ .Chart.AppVersion }} installed as "{{ .Release.Name }}".
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-api 8080:{{ .Values.api.service.port }}
+  curl localhost:8080/health/ready
+
+Processor autoscaling: {{ if .Values.processor.autoscaling.enabled }}KEDA on consumer lag ({{ .Values.processor.autoscaling.minReplicas }}-{{ .Values.processor.autoscaling.maxReplicas }} replicas){{ else }}disabled ({{ .Values.processor.replicas }} replicas){{ end }}
+  kubectl -n {{ .Release.Namespace }} get scaledobject,hpa,pods -w

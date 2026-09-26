@@ -97,6 +97,19 @@ jobs:
           -v "$PWD/observability/prometheus:/p:ro"
           prom/prometheus:v3.5.0 check config /p/prometheus.yml
 
+  helm:
+    name: Helm chart lint & render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/event-analytics
+      - name: Render with production and kind values (incl. KEDA ScaledObject)
+        run: |
+          helm template analytics deploy/helm/event-analytics --api-versions keda.sh/v1alpha1 > /dev/null
+          helm template analytics deploy/helm/event-analytics -f deploy/k8s/values-kind.yaml \
+            --api-versions keda.sh/v1alpha1 | grep -q "kind: ScaledObject"
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

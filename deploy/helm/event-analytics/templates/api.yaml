@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    {{- include "ea.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ea.selector" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}  # never drop below capacity during a rollout
+  template:
+    metadata:
+      labels:
+        {{- include "ea.selector" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        # Roll pods when configuration changes (env vars are read at start).
+        checksum/config: {{ toJson .Values.config | sha256sum }}
+    spec:
+      {{- include "ea.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: {{ include "ea.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8000}
+          {{- include "ea.envFrom" . | nindent 10 }}
+          env:
+            - {name: WEB_CONCURRENCY, value: {{ .Values.api.webConcurrency | quote }}}
+            - {name: OTEL_SERVICE_NAME, value: event-api}
+          # startup: allow boot time; liveness: process alive (never checks
+          # dependencies, or a Kafka blip restarts every pod); readiness:
+          # can serve (DB + Kafka) - failing it only removes the pod from the Service.
+          startupProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources: {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- include "ea.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}  # writable scratch; the root FS is read-only
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-api
+  labels: {{- include "ea.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "ea.selector" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  ports:
+    - {name: http, port: {{ .Values.api.service.port }}, targetPort: http}
+{{- if .Values.api.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-api
+  labels: {{- include "ea.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: {{ .Release.Name }}-api}
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-api
+  labels: {{- include "ea.labels" . | nindent 4 }}
+spec:
+  # Node drains/upgrades may not evict below this: ingestion stays up.
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "ea.selector" . | nindent 6 }}
+      app.kubernetes.io/component: api

@@ -1,4 +1,4 @@
-.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check read-key seed observability loadtest
+.PHONY: install up down logs infra migrate project console send lag events ch test lint format typecheck check read-key seed observability loadtest k8s-up k8s-down k8s-status k8s-burst
 
 install:        ## Create venv and install app + dev tools
 	python3.13 -m venv .venv
@@ -73,3 +73,19 @@ loadtest:       ## Ingestion load test: make loadtest [vus=40 | rate=250] batch=
 		-e WRITE_KEY=$$KEY -e BATCH=$(or $(batch),100) -e VUS=$(or $(vus),40) $(if $(rate),-e RATE=$(rate)) \
 		-e DURATION=$(or $(duration),30s) /scripts/ingest.js
 	@docker compose up -d api >/dev/null 2>&1   # quotas back on
+
+k8s-up:         ## Local Kubernetes (kind): cluster, KEDA, backing services, app via Helm
+	./deploy/k8s/up.sh
+
+k8s-down:       ## Delete the local cluster
+	kind delete cluster --name analytics
+
+k8s-status:     ## Pods, autoscalers and consumer lag
+	@kubectl -n analytics get pods,scaledobject,hpa
+	@kubectl -n analytics exec statefulset/redpanda -- rpk group describe event-processor 2>/dev/null | grep -E "^TOTAL-LAG" || true
+
+k8s-burst:      ## Build consumer lag (in-cluster k6 Job) and watch KEDA scale the processors
+	@KEY=$$(kubectl -n analytics exec deploy/analytics-api -- python -m app.cli create-project --name burst 2>/dev/null); \
+	kubectl -n analytics create secret generic burst-write-key --from-literal=key=$$KEY --dry-run=client -o yaml | kubectl apply -f - >/dev/null; \
+	kubectl -n analytics delete job burst --ignore-not-found >/dev/null; \
+	kubectl apply -f deploy/k8s/burst-job.yaml

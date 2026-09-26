@@ -7,7 +7,7 @@ send user events. The platform ingests them at high volume through Kafka,
 processes them, and answers funnel, retention and segmentation queries from
 ClickHouse.
 
-> **Status:** Phase 5 (operability) complete. See [Roadmap](#roadmap) and [benchmarks](#benchmarks).
+> **Status:** All six phases complete. See [Roadmap](#roadmap), [benchmarks](#benchmarks) and [Kubernetes](#kubernetes).
 
 ## Architecture
 
@@ -29,9 +29,28 @@ Dashed components arrive in later phases. Design rationale:
 [ADR 0002](docs/adr/0002-stream-processing-and-deduplication.md) (processing and dedup),
 [ADR 0003](docs/adr/0003-query-api.md) (query API),
 [ADR 0004](docs/adr/0004-identity-sessions-tracking-plans.md) (identity, sessions, tracking plans),
-[ADR 0005](docs/adr/0005-operability-and-load-testing.md) (metrics, tracing, quotas, load testing).
+[ADR 0005](docs/adr/0005-operability-and-load-testing.md) (metrics, tracing, quotas, load testing),
+[ADR 0006](docs/adr/0006-kubernetes-and-autoscaling.md) (Kubernetes and autoscaling).
 
 ## Highlights
+
+### Kubernetes (Phase 6)
+
+- **A Helm chart for the app**: migrations run as a `pre-install/pre-upgrade`
+  hook, the API has an HPA and a PodDisruptionBudget, probes split into
+  startup/liveness/readiness, and pods run non-root with a read-only root
+  filesystem.
+- **KEDA autoscales processors on Kafka consumer lag**, not CPU. On a local
+  kind cluster, a burst of 129k events (0 failures) took the processors from
+  1 to 3 as lag hit 56k, drained it to 0 in about 80 s, then stepped back
+  down one replica at a time.
+- **Gotchas found and fixed:**
+  - Kubernetes service-link env vars (`CLICKHOUSE_PORT=tcp://...`) crashed
+    startup
+  - KEDA's `cooldownPeriod` doesn't control scale-down (the HPA's 300 s
+    window does)
+  - the broker's advertised address must be fully qualified for clients in
+    other namespaces
 
 ### Operability (Phase 5)
 
@@ -259,6 +278,20 @@ make loadtest vus=16 batch=500 duration=40s
 
 Details are in [ADR 0005](docs/adr/0005-operability-and-load-testing.md).
 
+## Kubernetes
+
+```bash
+make down          # free memory: the Compose stack and a kind cluster don't both fit in 8 GB
+make k8s-up        # kind cluster + metrics-server + KEDA + backing services + Helm install
+make k8s-burst     # in-cluster load burst: watch processors scale on lag
+make k8s-status    # pods, autoscalers, consumer lag
+make k8s-down      # delete the cluster
+```
+
+Chart: [`deploy/helm/event-analytics`](deploy/helm/event-analytics). Laptop overrides:
+[`deploy/k8s/values-kind.yaml`](deploy/k8s/values-kind.yaml). The backing-service manifests
+in `deploy/k8s/infra/` are for local clusters only; in production, use managed services.
+
 ## Project layout
 
 ```
@@ -267,11 +300,14 @@ app/
   services/       Ingestion (validation, skew correction, produce), projects/keys
   processor/      Kafka consumer -> ClickHouse: parse, dedup, sink, DLQ, commit
   query/          Safe SQL builders, segmentation/funnel/retention, executor limits, cache
-  core/           Config, logging, Postgres, ClickHouse (+ migration runner), Kafka
+  core/           Config, logging, Postgres, ClickHouse, Kafka, metrics, tracing, quotas
   models/         Postgres metadata tables
   schemas/        Event and batch schemas
 migrations/       Alembic (Postgres)
 clickhouse/       ClickHouse migrations, demo-data generator, low-memory server config
+deploy/           Helm chart, kind config, local backing services, setup script
+observability/    Prometheus config + alert rules, Grafana dashboard
+loadtest/         k6 ingestion load test
 tests/            Against real Postgres, Redpanda, ClickHouse and Redis (isolated per session)
 docs/adr/         Architecture Decision Records
 ```
@@ -283,4 +319,4 @@ docs/adr/         Architecture Decision Records
 - [x] **Phase 3: Query API.** Segmentation, funnels, retention, read keys, injection-proof SQL, guard rails, caching with coalescing.
 - [x] **Phase 4: Sessions and schemas.** Retroactive identity merge, query-time sessionization, versioned tracking plans with breaking-change protection.
 - [x] **Phase 5: Operability.** Metrics, alerts and dashboard; tracing across Kafka; per-event quotas; load test (~17.4k events/s on a laptop, bottlenecks documented).
-- [ ] **Phase 6: Kubernetes.** kind + Helm, KEDA autoscaling on consumer lag.
+- [x] **Phase 6: Kubernetes.** Helm chart (hook migrations, HPA, PDB, probes, hardened pods), KEDA autoscaling on consumer lag, verified on kind.

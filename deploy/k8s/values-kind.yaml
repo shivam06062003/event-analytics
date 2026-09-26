@@ -1,0 +1,20 @@
+# Laptop overrides (8GB machine, single kind node, everything shares the CPUs).
+config:
+  ENVIRONMENT: local
+api:
+  replicas: 1
+  resources:
+    requests: {cpu: 100m, memory: 160Mi}
+    limits: {cpu: 750m, memory: 320Mi}
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 2
+processor:
+  resources:
+    requests: {cpu: 100m, memory: 112Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  autoscaling:
+    maxReplicas: 3        # production: = partitions (6)
+    lagThreshold: "2000"  # low, so a small burst visibly triggers scaling
+    cooldownPeriod: 45
+    scaleDownStabilizationSeconds: 60  # demo-friendly; production default is 300

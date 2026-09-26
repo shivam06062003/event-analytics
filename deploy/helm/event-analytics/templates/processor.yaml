@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-processor
+  labels:
+    {{- include "ea.labels" . | nindent 4 }}
+    app.kubernetes.io/component: processor
+spec:
+  {{- if not .Values.processor.autoscaling.enabled }}
+  replicas: {{ .Values.processor.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ea.selector" . | nindent 6 }}
+      app.kubernetes.io/component: processor
+  template:
+    metadata:
+      labels:
+        {{- include "ea.selector" . | nindent 8 }}
+        app.kubernetes.io/component: processor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        checksum/config: {{ toJson .Values.config | sha256sum }}
+    spec:
+      {{- include "ea.podSecurity" . | nindent 6 }}
+      # SIGTERM -> finish the current batch, commit, leave the consumer group
+      # (partitions move to other replicas immediately).
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: processor
+          image: {{ include "ea.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.processor"]
+          ports:
+            - {name: metrics, containerPort: 9100}
+          {{- include "ea.envFrom" . | nindent 10 }}
+          env:
+            - {name: OTEL_SERVICE_NAME, value: event-processor}
+          # Liveness: is the consume loop still turning? (heartbeat file)
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/processor-heartbeat') > 60)"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources: {{- toYaml .Values.processor.resources | nindent 12 }}
+          {{- include "ea.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+{{- if and .Values.processor.autoscaling.enabled (.Capabilities.APIVersions.Has "keda.sh/v1alpha1") }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Release.Name }}-processor
+  labels: {{- include "ea.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ .Release.Name }}-processor
+  minReplicaCount: {{ .Values.processor.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.processor.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.processor.autoscaling.pollingInterval }}
+  cooldownPeriod: {{ .Values.processor.autoscaling.cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.processor.autoscaling.scaleDownStabilizationSeconds }}
+          policies:
+            - {type: Pods, value: 1, periodSeconds: 30}  # shed one replica at a time
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ .Values.config.KAFKA_BOOTSTRAP_SERVERS }}
+        consumerGroup: {{ .Values.processor.autoscaling.consumerGroup }}
+        topic: {{ .Values.processor.autoscaling.topic }}
+        # desired replicas = ceil(total lag / lagThreshold), capped at max
+        lagThreshold: {{ .Values.processor.autoscaling.lagThreshold | quote }}
+        offsetResetPolicy: earliest
+        # Never scale beyond the partition count (idle consumers).
+        allowIdleConsumers: "false"
+{{- end }}
