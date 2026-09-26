@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy app
+
+  test:
+    name: Tests (real Postgres + Redpanda)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: analytics
+          POSTGRES_PASSWORD: analytics
+          POSTGRES_DB: analytics
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U analytics -d analytics"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://analytics:analytics@localhost:5433/analytics
+      KAFKA_BOOTSTRAP_SERVERS: localhost:19092
+      ENVIRONMENT: test
+      LOG_JSON: "false"
+    steps:
+      - uses: actions/checkout@v4
+      # Service containers can't take a start command, so Redpanda runs via docker run.
+      - name: Start Redpanda
+        run: |
+          docker run -d --name redpanda -p 19092:19092 redpandadata/redpanda:v25.2.9 \
+            redpanda start --mode=dev-container --smp=1 --memory=512M \
+            --kafka-addr=external://0.0.0.0:19092 --advertise-kafka-addr=external://localhost:19092
+          for i in $(seq 1 30); do
+            docker exec redpanda rpk cluster health -X brokers=localhost:19092 | grep -qE 'Healthy:.+true' && exit 0
+            sleep 2
+          done
+          docker logs redpanda; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Migrations round-trip and drift check
+        run: alembic upgrade head && alembic downgrade base && alembic upgrade head && alembic check
+      - run: pytest -v
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t event-analytics:ci .

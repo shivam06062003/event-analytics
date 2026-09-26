@@ -1,0 +1,86 @@
+# Host ports differ from the ledger project (Postgres 5433, API 8001) so both
+# stacks can run side by side if needed.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://analytics:analytics@postgres:5432/analytics
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  ENVIRONMENT: local
+  LOG_LEVEL: INFO
+  LOG_JSON: "true"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+      POSTGRES_DB: analytics
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics -d analytics"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Kafka-API-compatible broker: one binary, no ZooKeeper/KRaft controller to
+  # run, and a small memory footprint (capped at 512MB here for an 8GB laptop).
+  redpanda:
+    image: redpandadata/redpanda:v25.2.9
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --default-log-level=warn
+      # Two listeners: containers use redpanda:9092, the host (tests) uses localhost:19092.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # One-off: database migrations + Kafka topics, both "infrastructure as code".
+  migrate:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-topics"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment: *app-env
+    ports:
+      - "8001:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Optional web UI for browsing topics and messages: `make console` -> :8081
+  console:
+    profiles: [tools]
+    image: redpandadata/console:v3.2.2
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redpanda:
