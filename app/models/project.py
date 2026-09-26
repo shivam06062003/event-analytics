@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -55,3 +57,21 @@ class ReadKey(Base):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Changing ingestion rules (tracking plans) is more than reading data, so
+    # it needs an explicitly privileged read key.
+    can_manage: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+
+
+class TrackingPlan(Base):
+    """One version of a project's tracking plan. Append-only: every change is
+    a new version, so you can see exactly what the rules were at any time."""
+
+    __tablename__ = "tracking_plans"
+    __table_args__ = (UniqueConstraint("project_id", "version"),)
+    __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id"))
+    version: Mapped[int]
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -48,9 +48,16 @@ class CreatedReadKey:
     read_key: str  # plaintext, shown once
 
 
-async def create_read_key(session: AsyncSession, project_id: uuid.UUID) -> CreatedReadKey:
+async def create_read_key(
+    session: AsyncSession, project_id: uuid.UUID, *, can_manage: bool = False
+) -> CreatedReadKey:
     plaintext = READ_KEY_PREFIX + secrets.token_urlsafe(24)
-    key = ReadKey(project_id=project_id, prefix=plaintext[:11], key_hash=hash_key(plaintext))
+    key = ReadKey(
+        project_id=project_id,
+        prefix=plaintext[:11],
+        key_hash=hash_key(plaintext),
+        can_manage=can_manage,
+    )
     async with session.begin():
         session.add(key)
     return CreatedReadKey(key.id, plaintext)
@@ -63,7 +70,13 @@ async def revoke_read_key(session: AsyncSession, read_key_id: uuid.UUID) -> None
         )
 
 
-async def authenticate_read_key(plaintext: str) -> uuid.UUID:
+@dataclass(frozen=True)
+class ReadPrincipal:
+    project_id: uuid.UUID
+    can_manage: bool
+
+
+async def authenticate_read_key(plaintext: str) -> ReadPrincipal:
     """No cache here, unlike write keys: a leaked read key exposes data, so
     revocation must be instant. One indexed lookup is negligible next to the
     analytical query that follows it."""
@@ -71,7 +84,7 @@ async def authenticate_read_key(plaintext: str) -> uuid.UUID:
         key = await write_keys_repo.get_active_read_key(session, hash_key(plaintext))
     if key is None:
         raise Unauthenticated("Invalid or revoked read key")
-    return key.project_id
+    return ReadPrincipal(key.project_id, key.can_manage)
 
 
 async def revoke_write_key(session: AsyncSession, write_key_id: uuid.UUID) -> None:

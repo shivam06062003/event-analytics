@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.schemas.events import BatchRequest, RejectedEvent, TrackEvent
+from app.services import tracking_plans
 from app.services.errors import BatchTooLarge, IngestUnavailable, NoValidEvents
 
 logger = structlog.get_logger()
@@ -77,6 +78,7 @@ def build_message(
     sent_at: datetime | None,
     received_at: datetime,
     ip: str | None,
+    violations: list[str] | None = None,
 ) -> bytes:
     settings = get_settings()
     message: dict[str, Any] = {
@@ -101,16 +103,21 @@ def build_message(
         "ip": ip,
         "properties": event.properties,
         "context": event.context,
+        "violations": violations or [],
     }
     return orjson.dumps(message)
 
 
-def _validate(batch: list[dict[str, Any]]) -> tuple[list[TrackEvent], list[RejectedEvent]]:
-    valid: list[TrackEvent] = []
+def _validate(
+    batch: list[dict[str, Any]],
+) -> tuple[list[tuple[int, TrackEvent]], list[RejectedEvent]]:
+    """Returns (index in batch, event) for valid events, so later rejections
+    (e.g. by the tracking plan) can still report the client's original index."""
+    valid: list[tuple[int, TrackEvent]] = []
     rejected: list[RejectedEvent] = []
     for index, raw in enumerate(batch):
         try:
-            valid.append(TrackEvent.model_validate(raw))
+            valid.append((index, TrackEvent.model_validate(raw)))
         except ValidationError as exc:
             event_id = raw.get("event_id") if isinstance(raw, dict) else None
             rejected.append(
@@ -141,7 +148,25 @@ async def ingest_batch(
     # Partial acceptance: one malformed event (an SDK bug, a bad property)
     # must not make the client drop or endlessly retry 499 good ones.
     valid, rejected = _validate(request.batch)
-    if not valid:
+
+    # Tracking plan: in "block" mode violating events join `rejected`; in
+    # "warn" mode they go through, carrying their violations downstream.
+    plan = await tracking_plans.active_plan(project_id)
+    checked: list[tuple[TrackEvent, list[str]]] = []
+    for index, event in valid:
+        problems = tracking_plans.violations(event, plan) if plan else []
+        if problems and plan is not None and plan.enforcement == "block":
+            rejected.append(
+                RejectedEvent(
+                    index=index,
+                    event_id=str(event.event_id),
+                    errors=[f"tracking_plan: {p}" for p in problems],
+                )
+            )
+        else:
+            checked.append((event, problems))
+    rejected.sort(key=lambda r: r.index)
+    if not checked:
         raise NoValidEvents([r.model_dump() for r in rejected])
 
     try:
@@ -153,11 +178,16 @@ async def ingest_batch(
             await producer.send(
                 settings.raw_events_topic,
                 value=build_message(
-                    project_id, event, sent_at=request.sent_at, received_at=received_at, ip=ip
+                    project_id,
+                    event,
+                    sent_at=request.sent_at,
+                    received_at=received_at,
+                    ip=ip,
+                    violations=problems,
                 ),
                 key=partition_key(project_id, event.distinct_id),
             )
-            for event in valid
+            for event, problems in checked
         ]
         await asyncio.wait_for(
             asyncio.gather(*pending), timeout=settings.kafka_send_timeout_seconds + 5
@@ -166,7 +196,7 @@ async def ingest_batch(
         # Some events may have been written before the failure. That's fine:
         # the client retries the whole batch with the same event_ids, and the
         # processor de-duplicates (Phase 2).
-        logger.warning("ingest_unavailable", error=repr(exc), events=len(valid))
+        logger.warning("ingest_unavailable", error=repr(exc), events=len(checked))
         raise IngestUnavailable("Event log unavailable; retry the batch shortly") from exc
 
-    return IngestResult(accepted=len(valid), rejected=rejected)
+    return IngestResult(accepted=len(checked), rejected=rejected)

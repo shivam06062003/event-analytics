@@ -43,6 +43,7 @@ from app.core.db import SessionLocal, engine  # noqa: E402
 from app.core.kafka import ensure_topics, start_producer, stop_producer  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services import projects as project_service  # noqa: E402
+from app.services import tracking_plans  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,8 +101,16 @@ class TopicCollector:
     async def _run(self) -> None:
         assert self._consumer is not None
         async for record in self._consumer:
-            value = orjson.loads(record.value)
-            self.by_project[value["project_id"]].append(
+            # The topic deliberately contains poison messages (see the DLQ
+            # test). Skip anything we can't index, like the real processor
+            # does, or this background task dies and every later wait_for()
+            # times out with "got 0".
+            try:
+                value = orjson.loads(record.value)
+                project_id = value["project_id"]
+            except (orjson.JSONDecodeError, KeyError, TypeError):
+                continue
+            self.by_project[project_id].append(
                 Message((record.key or b"").decode(), record.partition, value)
             )
 
@@ -146,8 +155,19 @@ async def kafka() -> AsyncIterator[TopicCollector]:
 @pytest.fixture(autouse=True)
 async def clean_state() -> None:
     project_service.clear_write_key_cache()
+    tracking_plans.clear_cache()
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE read_keys, write_keys, projects"))
+        # Every table except Alembic's bookkeeping, discovered rather than
+        # listed, so a new table with a foreign key can't break cleanup.
+        tables = (
+            await conn.scalars(
+                text(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+                )
+            )
+        ).all()
+        await conn.execute(text(f"TRUNCATE {', '.join(tables)}"))
 
 
 @pytest.fixture

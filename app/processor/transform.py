@@ -12,7 +12,7 @@ from pydantic import AwareDatetime, BaseModel, ValidationError
 COLUMNS = (
     "project_id", "event_id", "event", "distinct_id", "user_id", "anonymous_id",
     "timestamp", "client_timestamp", "received_at", "properties", "context", "ip",
-    "kafka_partition", "kafka_offset",
+    "kafka_partition", "kafka_offset", "violations",
 )  # fmt: skip
 
 
@@ -32,6 +32,10 @@ class RawEventV1(BaseModel):
     ip: str | None
     properties: dict[str, Any]
     context: dict[str, Any]
+    # Added in Phase 4 WITHOUT bumping schema_version: an optional field with a
+    # default is backward compatible (old messages still parse) and forward
+    # compatible (an old processor ignores the unknown field).
+    violations: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,7 @@ class EventRow:
     ip: str | None
     kafka_partition: int
     kafka_offset: int
+    violations: tuple[str, ...] = ()
 
     @property
     def dedup_key(self) -> str:
@@ -106,4 +111,5 @@ def parse(value: bytes, key: bytes | None, partition: int, offset: int) -> Event
         ip=message.ip,
         kafka_partition=partition,
         kafka_offset=offset,
+        violations=tuple(message.violations),
     )

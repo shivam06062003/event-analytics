@@ -20,18 +20,20 @@ def at(days: float = 0, hours: float = 0) -> datetime:
 def row(
     project_id: str,
     event: str,
-    user: str,
+    user: str | None,
     when: datetime,
     properties: dict[str, Any] | None = None,
     event_id: uuid.UUID | None = None,
+    anonymous_id: str | None = None,
 ) -> EventRow:
+    """An event by `user` (identified) and/or `anonymous_id` (a visitor)."""
     return EventRow(
         project_id=uuid.UUID(project_id),
         event_id=event_id or uuid.uuid4(),
         event=event,
-        distinct_id=user,
+        distinct_id=user or anonymous_id or "",
         user_id=user,
-        anonymous_id=None,
+        anonymous_id=anonymous_id,
         timestamp=when,
         client_timestamp=None,
         received_at=when,

@@ -11,12 +11,20 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.query import executor
-from app.query.sql import Params, base_where, ch_datetime, filters_sql, property_value_sql
+from app.query.sql import (
+    Params,
+    base_where,
+    ch_datetime,
+    filters_sql,
+    person_events,
+    property_value_sql,
+)
 from app.schemas.queries import (
     INTERVAL_SECONDS,
     FunnelQuery,
     RetentionQuery,
     SegmentationQuery,
+    SessionsQuery,
 )
 
 OTHER_SEGMENT = "$other"
@@ -57,14 +65,21 @@ def buckets(start: datetime, end: datetime, interval: str) -> list[datetime]:
 
 async def segmentation(project_id: str, q: SegmentationQuery) -> dict[str, Any]:
     params = Params()
-    measure = "count()" if q.measure == "total" else "uniq(distinct_id)"
     segment = property_value_sql(params.add(q.breakdown, "String")) if q.breakdown else "''"
+    event_filter = f"AND event = {params.add(q.event, 'String')} {filters_sql(q.filters, params)}"
+    if q.measure == "total":
+        # Plain counts don't need identity: skip the join.
+        measure = "count()"
+        source = (
+            f"(SELECT * FROM events FINAL "
+            f"WHERE {base_where(project_id, q.from_, q.to, params)} {event_filter})"
+        )
+    else:
+        measure = "uniq(person_id)"  # a visitor who later signed up counts once
+        source = person_events(project_id, q.from_, q.to, params, event_filter)
     sql = f"""
         SELECT {_BUCKET_SQL[q.interval]} AS bucket, {segment} AS segment, {measure} AS value
-        FROM events FINAL
-        WHERE {base_where(project_id, q.from_, q.to, params)}
-          AND event = {params.add(q.event, "String")}
-          {filters_sql(q.filters, params)}
+        FROM {source}
         GROUP BY bucket, segment
     """
     rows = await executor.run(sql, params.values)
@@ -118,19 +133,23 @@ async def funnel(project_id: str, q: FunnelQuery) -> dict[str, Any]:
             condition += f" AND timestamp < {end_placeholder}"
         conditions.append(condition)
     events_placeholder = params.add(sorted({s.event for s in q.steps}), "Array(String)")
-    # ...but may finish it up to window_seconds after the range ends; otherwise
+    window_placeholder = params.add(q.window_seconds, "UInt64")
+    # ...but may finish up to window_seconds after the range ends; otherwise
     # everyone who entered near the end would look like they dropped off.
+    source = person_events(
+        project_id, q.from_, q.to + window, params, f"AND has({events_placeholder}, event)"
+    )
+    # Grouped by PERSON: a funnel that starts anonymous (landing page) and
+    # finishes identified (purchase after login) is one conversion, not zero.
     sql = f"""
         SELECT level, count() AS users
         FROM (
-            SELECT distinct_id,
-                   windowFunnel({params.add(q.window_seconds, "UInt64")})(
+            SELECT person_id,
+                   windowFunnel({window_placeholder})(
                        toDateTime(timestamp), {", ".join(conditions)}
                    ) AS level
-            FROM events FINAL
-            WHERE {base_where(project_id, q.from_, q.to + window, params)}
-              AND has({events_placeholder}, event)
-            GROUP BY distinct_id
+            FROM {source}
+            GROUP BY person_id
         )
         WHERE level > 0
         GROUP BY level
@@ -164,29 +183,29 @@ async def retention(project_id: str, q: RetentionQuery) -> dict[str, Any]:
     period_fn = "toStartOfWeek(timestamp, 1)" if q.period == "week" else "toDate(timestamp)"
     period_length = timedelta(weeks=1) if q.period == "week" else timedelta(days=1)
     return_filter = f"AND event = {params.add(q.return_event, 'String')}" if q.return_event else ""
-    cohort_where = base_where(project_id, q.from_, q.to, params)
-    start_event = params.add(q.start_event, "String")
-    activity_where = base_where(project_id, q.from_, q.to + period_length * q.periods, params)
+    start_filter = f"AND event = {params.add(q.start_event, 'String')}"
+    cohort_source = person_events(project_id, q.from_, q.to, params, start_filter)
+    activity_source = person_events(
+        project_id, q.from_, q.to + period_length * q.periods, params, return_filter
+    )
     periods = params.add(q.periods, "UInt32")
     sql = f"""
         WITH
             cohorts AS (
-                -- Each user's cohort: the period of their FIRST start_event in range.
-                SELECT distinct_id, min({period_fn}) AS cohort
-                FROM events FINAL
-                WHERE {cohort_where} AND event = {start_event}
-                GROUP BY distinct_id
+                -- Each person's cohort: the period of their FIRST start_event in range.
+                SELECT person_id, min({period_fn}) AS cohort
+                FROM {cohort_source}
+                GROUP BY person_id
             ),
             activity AS (
-                SELECT DISTINCT distinct_id, {period_fn} AS period
-                FROM events FINAL
-                WHERE {activity_where} {return_filter}
+                SELECT DISTINCT person_id, {period_fn} AS period
+                FROM {activity_source}
             )
         SELECT c.cohort,
                dateDiff('{q.period}', c.cohort, a.period) AS offset,
-               uniqExact(c.distinct_id) AS users
+               uniqExact(c.person_id) AS users
         FROM cohorts AS c
-        INNER JOIN activity AS a ON a.distinct_id = c.distinct_id
+        INNER JOIN activity AS a ON a.person_id = c.person_id
         WHERE offset BETWEEN 0 AND {periods}
         GROUP BY c.cohort, offset
         UNION ALL
@@ -217,6 +236,110 @@ async def retention(project_id: str, q: RetentionQuery) -> dict[str, Any]:
     return {"period": q.period, "cohorts": cohorts}
 
 
+# --- Sessions --------------------------------------------------------------------
+
+
+async def sessions(project_id: str, q: SessionsQuery) -> dict[str, Any]:
+    """Sessionization at query time: a new session starts when a person has
+    been inactive for more than `inactivity_minutes`.
+
+    Why at query time instead of in the stream processor: late events. An
+    event that arrives hours late must merge into (or split) the right
+    session. A streaming sessionizer must hold per-person state and still gets
+    late data wrong; recomputing from stored events is always correct.
+
+    Events are loaded from one inactivity gap BEFORE `from`, so a session
+    already running at `from` isn't mistaken for a new one; only sessions
+    STARTING in [from, to) are reported. Sessions are followed up to 24h past
+    `to` so their duration isn't cut short.
+    """
+    params = Params()
+    gap = timedelta(minutes=q.inactivity_minutes)
+    source = person_events(project_id, q.from_ - gap, q.to + timedelta(hours=24), params)
+    gap_seconds = params.add(int(gap.total_seconds()), "UInt32")
+    start = params.add(ch_datetime(q.from_), "DateTime64(3)")
+    end = params.add(ch_datetime(q.to), "DateTime64(3)")
+    bucket = _BUCKET_SQL[q.interval].replace("timestamp", "started")
+    sql = f"""
+        SELECT {bucket} AS bucket,
+               count() AS sessions,
+               uniq(person_id) AS users,
+               sum(dateDiff('millisecond', started, ended)) / 1000 AS total_duration_seconds,
+               countIf(events = 1) AS bounces,
+               sum(events) AS total_events
+        FROM (
+            SELECT person_id, session_seq,
+                   min(timestamp) AS started, max(timestamp) AS ended, count() AS events
+            FROM (
+                -- Running count of session starts = session number per person.
+                SELECT person_id, timestamp,
+                       sum(is_start) OVER (
+                           PARTITION BY person_id ORDER BY timestamp
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS session_seq
+                FROM (
+                    -- 1 when this is the person's first event, or the gap since
+                    -- their previous event exceeds the inactivity limit.
+                    SELECT person_id, timestamp,
+                           if(row_number() OVER w = 1
+                              OR dateDiff('second', lagInFrame(timestamp) OVER w, timestamp)
+                                 > {gap_seconds}, 1, 0) AS is_start
+                    FROM {source}
+                    WINDOW w AS (PARTITION BY person_id ORDER BY timestamp
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+            )
+            GROUP BY person_id, session_seq
+        )
+        WHERE started >= {start} AND started < {end}
+        GROUP BY bucket
+    """
+    rows = await executor.run(sql, params.values)
+    by_bucket = {_as_utc(r[0]): r for r in rows}
+
+    points = []
+    total_sessions = total_bounces = total_events = 0
+    total_duration = 0.0
+    for b in buckets(q.from_, q.to, q.interval):
+        _, n, users, duration, bounces, events = by_bucket.get(b, (b, 0, 0, 0.0, 0, 0))
+        n, users, bounces, events, duration = (
+            int(n),
+            int(users),
+            int(bounces),
+            int(events),
+            float(duration),
+        )
+        points.append(
+            {
+                "bucket": b,
+                "sessions": n,
+                "users": users,
+                "avg_duration_seconds": round(duration / n, 1) if n else 0.0,
+                "bounce_rate": _rate(bounces, n),
+                "events_per_session": round(events / n, 2) if n else 0.0,
+            }
+        )
+        total_sessions += n
+        total_bounces += bounces
+        total_events += events
+        total_duration += duration
+    return {
+        "values": points,
+        # Session-weighted. (Unique users aren't additive across buckets, so
+        # there is deliberately no total "users".)
+        "totals": {
+            "sessions": total_sessions,
+            "avg_duration_seconds": round(total_duration / total_sessions, 1)
+            if total_sessions
+            else 0.0,
+            "bounce_rate": _rate(total_bounces, total_sessions),
+            "events_per_session": round(total_events / total_sessions, 2)
+            if total_sessions
+            else 0.0,
+        },
+    }
+
+
 async def event_names(project_id: str, days: int) -> list[dict[str, Any]]:
     params = Params()
     now = datetime.now(UTC)
@@ -231,3 +354,20 @@ async def event_names(project_id: str, days: int) -> list[dict[str, Any]]:
 
 def _rate(part: int, whole: int) -> float:
     return round(part / whole, 4) if whole else 0.0
+
+
+async def violation_counts(project_id: str, days: int) -> list[dict[str, Any]]:
+    params = Params()
+    now = datetime.now(UTC)
+    where = base_where(project_id, now - timedelta(days=days), now + timedelta(minutes=5), params)
+    sql = f"""
+        SELECT event, violation, count() AS n
+        FROM events
+        ARRAY JOIN violations AS violation
+        WHERE {where}
+        GROUP BY event, violation
+        ORDER BY n DESC
+        LIMIT 200
+    """
+    rows = await executor.run(sql, params.values)
+    return [{"event": e, "violation": v, "count": int(n)} for e, v, n in rows]

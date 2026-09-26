@@ -43,3 +43,22 @@ class QueryTimeout(DomainError):
 
 class QueryTooExpensive(DomainError):
     code = "query_too_expensive"
+
+
+class Forbidden(DomainError):
+    code = "forbidden"
+
+
+class NotFound(DomainError):
+    code = "not_found"
+
+
+class BreakingChange(DomainError):
+    code = "breaking_change"
+
+    def __init__(self, changes: list[str]) -> None:
+        super().__init__(
+            "The new plan would reject events the current plan accepts. "
+            "Resend with allow_breaking_changes=true to apply it anyway.",
+            details=changes,
+        )

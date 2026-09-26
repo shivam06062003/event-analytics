@@ -7,7 +7,7 @@ from redis.asyncio import Redis
 
 from app.api.errors import register_error_handlers
 from app.api.middleware import body_size_limit_middleware, request_context_middleware
-from app.api.routes import health, ingest, query
+from app.api.routes import health, ingest, query, tracking_plan
 from app.core import clickhouse
 from app.core.config import get_settings
 from app.core.db import engine
@@ -49,6 +49,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(ingest.router)
     app.include_router(query.router)
+    app.include_router(tracking_plan.router)
     return app
 
 

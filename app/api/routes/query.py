@@ -14,6 +14,8 @@ from app.schemas.queries import (
     RetentionResult,
     SegmentationQuery,
     SegmentationResult,
+    SessionsQuery,
+    SessionsResult,
 )
 
 router = APIRouter(prefix="/v1", tags=["queries"])
@@ -55,6 +57,14 @@ async def retention(body: RetentionQuery, project_id: ReadKeyProject) -> Retenti
     """Cohorts by first start_event; share of each cohort returning in later periods."""
     data = await _cached(str(project_id), "retention", body, body.to, queries.retention)
     return RetentionResult.model_validate(data)
+
+
+@router.post("/query/sessions")
+async def sessions(body: SessionsQuery, project_id: ReadKeyProject) -> SessionsResult:
+    """Sessions per bucket (a new session after `inactivity_minutes` idle): count,
+    unique users, average duration, bounce rate and events per session."""
+    data = await _cached(str(project_id), "sessions", body, body.to, queries.sessions)
+    return SessionsResult.model_validate(data)
 
 
 @router.get("/event-names")

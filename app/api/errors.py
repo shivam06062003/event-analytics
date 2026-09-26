@@ -12,8 +12,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.services.errors import (
     BatchTooLarge,
+    BreakingChange,
     DomainError,
+    Forbidden,
     IngestUnavailable,
+    NotFound,
     NoValidEvents,
     QueryTimeout,
     QueryTooExpensive,
@@ -27,6 +30,9 @@ _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     IngestUnavailable: status.HTTP_503_SERVICE_UNAVAILABLE,
     QueryTimeout: status.HTTP_504_GATEWAY_TIMEOUT,
     QueryTooExpensive: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    Forbidden: status.HTTP_403_FORBIDDEN,
+    NotFound: status.HTTP_404_NOT_FOUND,
+    BreakingChange: status.HTTP_409_CONFLICT,
 }
 INGEST_RETRY_AFTER_SECONDS = 5
 

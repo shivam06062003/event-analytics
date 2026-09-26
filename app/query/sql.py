@@ -86,3 +86,40 @@ def base_where(project_id: str, start: datetime, end: datetime, params: Params) 
         f"AND timestamp >= {params.add(ch_datetime(start), 'DateTime64(3)')} "
         f"AND timestamp < {params.add(ch_datetime(end), 'DateTime64(3)')}"
     )
+
+
+def person_events(
+    project_id: str, start: datetime, end: datetime, params: Params, extra_where: str = ""
+) -> str:
+    """events FINAL for one project and range, plus a resolved `person_id`.
+
+    Identity resolution happens at QUERY time: an event belongs to
+      1. its user_id, if the event has one;
+      2. else the user its anonymous_id was first linked to (identity_links);
+      3. else its anonymous_id (a visitor who never identified).
+    Because this runs on every query, merging is retroactive: the anonymous
+    browsing before a signup counts toward the user as soon as the link
+    exists, without rewriting any stored rows (updates are costly in
+    ClickHouse; reads are what it's good at).
+
+    argMin(user_id, linked_at) = the FIRST user an anonymous id was linked to.
+    On a shared device (two people logging in on one browser) the anonymous
+    history stays with the first person instead of fusing two people together.
+    """
+    project = params.add(project_id, "UUID")
+    return f"""(
+        SELECT e.*,
+               if(e.user_id IS NOT NULL, e.user_id,
+                  if(l.linked_user != '', l.linked_user, e.distinct_id)) AS person_id
+        FROM (
+            SELECT * FROM events FINAL
+            WHERE {base_where(project_id, start, end, params)} {extra_where}
+        ) AS e
+        LEFT JOIN (
+            SELECT anonymous_id, argMin(user_id, linked_at) AS linked_user
+            FROM identity_links
+            -- Defensive: never resolve through a half-empty link.
+            WHERE project_id = {project} AND anonymous_id != '' AND user_id != ''
+            GROUP BY anonymous_id
+        ) AS l ON l.anonymous_id = e.anonymous_id
+    )"""

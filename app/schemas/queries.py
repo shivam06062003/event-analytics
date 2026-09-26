@@ -56,10 +56,24 @@ class SegmentationQuery(TimeRange):
 
     @model_validator(mode="after")
     def _check_buckets(self) -> "SegmentationQuery":
-        buckets = (self.to - self.from_).total_seconds() / INTERVAL_SECONDS[self.interval]
-        limit = get_settings().query_max_buckets
-        if buckets > limit:
-            raise ValueError(f"{int(buckets)} {self.interval} buckets exceed the limit of {limit}")
+        _check_bucket_count(self.from_, self.to, self.interval)
+        return self
+
+
+def _check_bucket_count(start: datetime, end: datetime, interval: str) -> None:
+    buckets = (end - start).total_seconds() / INTERVAL_SECONDS[interval]
+    limit = get_settings().query_max_buckets
+    if buckets > limit:
+        raise ValueError(f"{int(buckets)} {interval} buckets exceed the limit of {limit}")
+
+
+class SessionsQuery(TimeRange):
+    interval: Interval = "day"
+    inactivity_minutes: Annotated[int, Field(ge=1, le=240)] = 30
+
+    @model_validator(mode="after")
+    def _check_buckets(self) -> "SessionsQuery":
+        _check_bucket_count(self.from_, self.to, self.interval)
         return self
 
 
@@ -135,3 +149,25 @@ class RetentionResult(BaseModel):
 class EventNameCount(BaseModel):
     event: str
     count: int
+
+
+class SessionsPoint(BaseModel):
+    bucket: datetime
+    sessions: int
+    users: int
+    avg_duration_seconds: float
+    bounce_rate: float
+    events_per_session: float
+
+
+class SessionsTotals(BaseModel):
+    sessions: int
+    avg_duration_seconds: float
+    bounce_rate: float
+    events_per_session: float
+
+
+class SessionsResult(BaseModel):
+    values: list[SessionsPoint]
+    totals: SessionsTotals
+    meta: QueryMeta

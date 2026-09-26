@@ -7,7 +7,7 @@ send user events. The platform ingests them at high volume through Kafka,
 processes them, and answers funnel, retention and segmentation queries from
 ClickHouse.
 
-> **Status:** Phase 3 (query API) complete. See [Roadmap](#roadmap) and [benchmarks](#benchmarks).
+> **Status:** Phase 4 (identity, sessions, tracking plans) complete. See [Roadmap](#roadmap) and [benchmarks](#benchmarks).
 
 ## Architecture
 
@@ -27,9 +27,29 @@ flowchart LR
 Dashed components arrive in later phases. Design rationale:
 [ADR 0001](docs/adr/0001-architecture-and-ingestion.md) (architecture and ingestion) and
 [ADR 0002](docs/adr/0002-stream-processing-and-deduplication.md) (processing and dedup),
-[ADR 0003](docs/adr/0003-query-api.md) (query API).
+[ADR 0003](docs/adr/0003-query-api.md) (query API),
+[ADR 0004](docs/adr/0004-identity-sessions-tracking-plans.md) (identity, sessions, tracking plans).
 
 ## Highlights
+
+### Identity, sessions, tracking plans (Phase 4)
+
+- **Retroactive identity merge.** A ClickHouse materialized view records
+  anonymous → user links on insert, and queries resolve each event to a
+  person at read time. A funnel from anonymous browsing to a purchase after
+  login counts as one conversion. The first link wins, so shared devices
+  don't fuse people.
+- **Sessionization at query time** with window functions (`lagInFrame`, a
+  running `sum`). Late events land in the right session, sessions spanning
+  login stay whole, and range edges are handled correctly (tested).
+- **Tracking plans.** Versioned per-project event schemas enforced at
+  ingestion (warn records violations, block rejects). **Breaking changes are
+  refused** unless forced, the same BACKWARD compatibility idea as schema
+  registries.
+- **Found and fixed:** a ClickHouse alias-shadowing bug in the materialized
+  view (fixed with a corrective migration, not by editing an applied one), a
+  test that couldn't tell Alice from Bob, and a test-harness consumer that
+  died on poison messages.
 
 ### Query API (Phase 3)
 
@@ -172,7 +192,12 @@ curl -s localhost:8001/v1/query/funnel -H "Authorization: Bearer $READ_KEY" -H '
 | `POST /v1/query/segmentation` | `event`, `interval` (hour/day/week), `measure` (total/unique_users), `breakdown`, `filters` |
 | `POST /v1/query/funnel` | `steps` (each with optional `filters`), `window_seconds` |
 | `POST /v1/query/retention` | `start_event`, `return_event` (or any), `period` (day/week), `periods` |
+| `POST /v1/query/sessions` | `interval`, `inactivity_minutes`: sessions, users, avg duration, bounce rate, events/session |
 | `GET /v1/event-names` | Recent event names by frequency |
+| `GET /v1/tracking-plan` · `PUT` (key with `--manage`) | Versioned event schemas; `PUT` refuses breaking changes unless `allow_breaking_changes` |
+| `GET /v1/tracking-plan/violations` | Recorded violations by event and reason |
+
+People-based queries (unique users, funnels, retention, sessions) count **persons**: anonymous activity is merged into the user it was later linked to.
 
 Filter operators: `eq`, `neq`, `contains`, `gt`, `gte`, `lt`, `lte`, `is_set`, `is_not_set`.
 Every response includes `meta.cached` and `meta.computed_at`.
@@ -187,6 +212,7 @@ M1 laptop stack with ClickHouse capped at 1.2 GB:
 | Segmentation: unique users by path, daily | 798 ms | 66 ms |
 | Funnel: 3 steps | 366 ms | 46 ms |
 | Retention: 8 × 8 weekly cohorts | 1,350 ms | 65 ms |
+| Sessions: 953k sessions, weekly | 3,838 ms | ~60 ms |
 
 - The funnel returns 40.1% → 54.95%, matching the generator's 40% and 55%
   probabilities.
@@ -218,6 +244,6 @@ docs/adr/         Architecture Decision Records
 - [x] **Phase 1: Ingestion.** Batch API, write keys, durable idempotent producer, partitioning, skew correction, partial acceptance, limits.
 - [x] **Phase 2: Processing.** Consumer group writes to ClickHouse, two-layer dedup, dead-letter topic, commit after write, pause-based backpressure, lag.
 - [x] **Phase 3: Query API.** Segmentation, funnels, retention, read keys, injection-proof SQL, guard rails, caching with coalescing.
-- [ ] **Phase 4: Sessions and schemas.** Sessionization, late events, identity merge, tracking plans with schema evolution.
+- [x] **Phase 4: Sessions and schemas.** Retroactive identity merge, query-time sessionization, versioned tracking plans with breaking-change protection.
 - [ ] **Phase 5: Operability.** Metrics, tracing, per-project quotas, load test (target: 20k+ events/s).
 - [ ] **Phase 6: Kubernetes.** kind + Helm, KEDA autoscaling on consumer lag.

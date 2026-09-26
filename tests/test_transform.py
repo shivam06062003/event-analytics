@@ -67,3 +67,13 @@ def test_json_that_is_not_an_object_is_dead_lettered() -> None:
 
     assert isinstance(letter, DeadLetter)
     assert letter.reason == "not_an_object"
+
+
+def test_messages_from_before_violations_existed_still_parse() -> None:
+    old_format = orjson.loads(message())
+    old_format.pop("violations", None)
+
+    row = parse(orjson.dumps(old_format), None, 0, 0)
+
+    assert isinstance(row, EventRow)
+    assert row.violations == ()
